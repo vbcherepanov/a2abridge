@@ -9,11 +9,16 @@ other, share an inbox, send each other tasks, and survive across
 machines with mTLS. No vendor lock-in — runs on the open Linux
 Foundation standard.
 
+[![Build](https://github.com/vbcherepanov/a2abridge/actions/workflows/build.yml/badge.svg)](https://github.com/vbcherepanov/a2abridge/actions/workflows/build.yml)
+[![Release](https://img.shields.io/github/v/release/vbcherepanov/a2abridge?display_name=tag&sort=semver)](https://github.com/vbcherepanov/a2abridge/releases)
+[![Go Reference](https://pkg.go.dev/badge/github.com/vbcherepanov/a2abridge.svg)](https://pkg.go.dev/github.com/vbcherepanov/a2abridge)
+[![Go Report Card](https://goreportcard.com/badge/github.com/vbcherepanov/a2abridge)](https://goreportcard.com/report/github.com/vbcherepanov/a2abridge)
 [![A2A Protocol 1.0](https://img.shields.io/badge/A2A%20Protocol-1.0-1f6feb)](https://a2a-protocol.org/latest/specification/)
 [![Linux Foundation](https://img.shields.io/badge/Linux%20Foundation-LF%20AI%20%26%20Data-0f1f3d)](https://lfaidata.foundation/)
 [![Go 1.25](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go)](https://go.dev/)
 [![macOS · Linux · Windows · WSL2](https://img.shields.io/badge/OS-macOS%20%7C%20Linux%20%7C%20Windows%20%7C%20WSL2-success)]()
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Sponsor](https://img.shields.io/badge/Sponsor-%F0%9F%92%9B-pink)](https://github.com/sponsors/vbcherepanov)
 
 ---
 

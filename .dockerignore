@@ -1,0 +1,14 @@
+.git
+.github
+.golangci.yml
+.gitignore
+*.md
+docs/
+README.md.bak.*
+*.bak.*
+bin/
+dist/
+.a2a/
+*.pem
+*.key
+*.crt

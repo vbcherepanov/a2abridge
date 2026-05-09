@@ -23,6 +23,12 @@ jobs:
           cache: true
       - name: vet
         run: go vet ./...
+      - name: golangci-lint
+        if: matrix.os == 'ubuntu-latest'
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout 3m
       - name: test
         run: go test ./... -race -count=1
       - name: build

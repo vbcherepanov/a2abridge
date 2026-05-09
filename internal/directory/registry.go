@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/vbcherepanov/a2abridge/internal/metrics"
 )
 
 type Entry struct {
@@ -68,9 +70,12 @@ func (r *Registry) List() []Entry {
 func (r *Registry) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
+	mux.Handle("GET /metrics", metrics.Handler())
 	mux.HandleFunc("GET /agents", func(w http.ResponseWriter, _ *http.Request) {
+		entries := r.List()
+		metrics.SetPeers(len(entries))
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(r.List())
+		_ = json.NewEncoder(w).Encode(entries)
 	})
 	mux.HandleFunc("POST /register", func(w http.ResponseWriter, req *http.Request) {
 		var body struct {

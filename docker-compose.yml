@@ -1,0 +1,31 @@
+# docker-compose.yml — turnkey directory + N bridges in one stack.
+# Useful for testing the cross-machine federation flow without setting up
+# multiple physical hosts. The "bridge" service is intentionally
+# parameterised so you can `docker compose up --scale bridge=4` to spin
+# up four peers sharing the same directory.
+
+services:
+  directory:
+    image: ghcr.io/vbcherepanov/a2abridge:latest
+    container_name: a2abridge-directory
+    command: ["directory", "-addr", "0.0.0.0:7777"]
+    ports:
+      - "127.0.0.1:7777:7777"
+    restart: unless-stopped
+
+  # NOTE: bridge needs a real MCP stdio peer (Claude / Codex / Cursor).
+  # Inside Docker that's not how anyone runs it — this service exists
+  # to demo cross-container peer-to-peer A2A traffic between bridges
+  # that talk to each other directly via the shared directory.
+  bridge:
+    image: ghcr.io/vbcherepanov/a2abridge:latest
+    depends_on: [directory]
+    environment:
+      A2A_DIRECTORY: "http://directory:7777"
+      A2A_BIND: "0.0.0.0:0"
+      A2A_NAME: "compose-peer"
+      A2A_SKILLS: "demo"
+    # Idle the container — the bridge subcommand expects MCP stdio,
+    # which we don't have here, so we keep the binary alive and let
+    # other tooling (curl from another container) hit the directory.
+    command: ["directory", "-addr", "0.0.0.0:7778"]

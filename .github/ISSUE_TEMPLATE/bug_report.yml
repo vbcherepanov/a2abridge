@@ -1,0 +1,72 @@
+name: 🐛 Bug report
+description: Something is wrong with a2abridge — let's get it fixed.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before opening a bug, please run `a2abridge doctor` and paste its
+        full output below. That alone resolves most "it's not connecting"
+        reports.
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`a2abridge doctor` output"
+      description: "Paste the entire output, redact paths/usernames if you must."
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: a2abridge version
+      description: "`a2abridge version`"
+      placeholder: "a2abridge 2.0.0 (commit abc123, darwin/arm64)"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS / arch
+      description: "macOS 14.5 / Ubuntu 22.04 / Windows 11 / WSL2 (Ubuntu 22.04)"
+    validations:
+      required: true
+  - type: dropdown
+    id: ide
+    attributes:
+      label: Affected IDE(s)
+      multiple: true
+      options:
+        - Claude Code
+        - Codex CLI
+        - Cursor
+        - Cline (VS Code)
+        - Continue
+        - Gemini CLI
+        - Other (specify in description)
+        - N/A — bridge issue, not IDE-specific
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: "1. ...  2. ...  3. ..."
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What actually happened
+      description: "Logs, error messages, screenshots — drop them all in."
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: "Custom env vars (A2A_*), federation enabled, mTLS configured, network setup, etc."

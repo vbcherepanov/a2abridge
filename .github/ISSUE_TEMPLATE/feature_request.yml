@@ -1,0 +1,29 @@
+name: 🚀 Feature request
+description: Suggest a new capability or behaviour.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: "Describe the use case, not the proposed solution."
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed approach (optional)
+      description: "If you already have an idea — sketch it here. CLI flag, new subcommand, MCP tool, env var, etc."
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - tiny (1 flag / 1 line)
+        - small (1 file)
+        - medium (multi-file refactor)
+        - large (new subcommand or major capability)

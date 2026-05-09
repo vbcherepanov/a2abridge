@@ -1,0 +1,57 @@
+# golangci-lint v1.61+ config. Tuned for a small open-source Go project —
+# we lean on the default linters plus a few extras that catch real bugs
+# without drowning new contributors in style nits.
+run:
+  timeout: 3m
+  go: "1.25"
+
+linters:
+  disable-all: true
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - gocritic
+    - gosec
+    - misspell
+    - revive
+    - bodyclose
+    - errorlint
+    - nakedret
+    - prealloc
+
+linters-settings:
+  gocritic:
+    enabled-tags: [diagnostic, style, performance]
+    disabled-checks:
+      - ifElseChain  # too noisy for the dispatcher style we use
+  gosec:
+    excludes:
+      - G104  # already covered by errcheck
+  revive:
+    rules:
+      - name: blank-imports
+      - name: context-as-argument
+      - name: context-keys-type
+      - name: dot-imports
+      - name: error-return
+      - name: error-strings
+      - name: errorf
+      - name: increment-decrement
+      - name: range
+      - name: receiver-naming
+      - name: time-naming
+      - name: unexported-return
+      - name: var-declaration
+
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters: [errcheck, gosec, gocritic]
+    # The CLI dispatcher pattern intentionally has a bunch of switches
+    # that gocritic flags as ifElseChain — we already turn that off,
+    # but other false positives can accumulate; keep this rule slot ready.
+  max-issues-per-linter: 0
+  max-same-issues: 0
