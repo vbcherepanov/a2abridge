@@ -3,7 +3,12 @@
 # without drowning new contributors in style nits.
 run:
   timeout: 3m
-  go: "1.25"
+  # NOTE: do NOT pin `go:` here. Older golangci-lint releases are compiled
+  # with the previous Go minor (e.g. v1.64 was built on go1.24) and will
+  # refuse to load a config that targets a newer toolchain than they were
+  # built with. Letting the linter inspect go.mod itself avoids the
+  # "Go language version used to build golangci-lint is lower than the
+  # targeted Go version" failure on CI.
 
 linters:
   disable-all: true
