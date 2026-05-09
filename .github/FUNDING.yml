@@ -1,0 +1,4 @@
+# GitHub Funding configuration. Adds the "Sponsor" button to the repo
+# header and the FUNDING badge in dependents' repos.
+github: [vbcherepanov]
+custom: ['https://PayPal.Me/vbcherepanov']

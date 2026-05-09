@@ -1,6 +1,13 @@
 # a2abridge
 
-> The open A2A protocol bridge for AI coding agents. Make Claude Code, Codex CLI, Cursor, Cline, Continue and Gemini CLI see each other and talk over a real protocol — not a vendor wall garden.
+## Stop copy-pasting between your AI coding agents.
+
+Claude in your IDE, Codex in a terminal, Cursor in another window —
+all isolated by default. **a2abridge** wires them into a single
+[A2A 1.0](https://a2a-protocol.org/latest/) mesh: peers find each
+other, share an inbox, send each other tasks, and survive across
+machines with mTLS. No vendor lock-in — runs on the open Linux
+Foundation standard.
 
 [![A2A Protocol 1.0](https://img.shields.io/badge/A2A%20Protocol-1.0-1f6feb)](https://a2a-protocol.org/latest/specification/)
 [![Linux Foundation](https://img.shields.io/badge/Linux%20Foundation-LF%20AI%20%26%20Data-0f1f3d)](https://lfaidata.foundation/)
@@ -593,6 +600,18 @@ Conventional Commits, English subjects, no AI co-authors.
 - mTLS server/client auth with ed25519 cert generation
 
 Not yet implemented (v1.1+): gRPC binding (§7.2), cross-machine directory discovery via mDNS, retry policy for push delivery.
+
+## Support the project
+
+a2abridge is MIT-licensed and free, but it's also a one-developer
+project that runs on weekends. If it saves you copy-paste between
+agents, consider chipping in:
+
+- 💛 [GitHub Sponsors](https://github.com/sponsors/vbcherepanov) — recurring or one-off, GitHub-native
+- 💸 [PayPal](https://PayPal.Me/vbcherepanov) — one-shot donations
+
+Sponsors get their name in the repo `README` and direct line for
+feature requests.
 
 ## License
 
