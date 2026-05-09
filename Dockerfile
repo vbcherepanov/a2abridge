@@ -3,7 +3,7 @@
 # attach `a2abridge worker` to a sidecar — without dragging glibc/Alpine
 # CVEs into your stack.
 
-FROM golang:1.25-alpine AS build
+FROM golang:1.26-alpine AS build
 WORKDIR /src
 
 # Cache module fetch separately so source-only edits skip re-download.
