@@ -1,0 +1,67 @@
+name: release
+
+# Triggered on tags vX.Y.Z. Cross-compiles a2abridge for the supported
+# os/arch matrix, packs each artifact and attaches them to the GitHub
+# Release. install.sh / install.ps1 download those artifacts.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: darwin,  goarch: amd64, ext: tar.gz }
+          - { goos: darwin,  goarch: arm64, ext: tar.gz }
+          - { goos: linux,   goarch: amd64, ext: tar.gz }
+          - { goos: linux,   goarch: arm64, ext: tar.gz }
+          - { goos: windows, goarch: amd64, ext: zip    }
+    env:
+      GOOS:   ${{ matrix.goos }}
+      GOARCH: ${{ matrix.goarch }}
+      CGO_ENABLED: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.25' }
+
+      - name: derive ldflags
+        id: ld
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          sha="$(git rev-parse --short HEAD)"
+          date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "ldflags=-s -w \
+            -X github.com/vitalii/a2abridge/internal/buildinfo.Version=${ver} \
+            -X github.com/vitalii/a2abridge/internal/buildinfo.Commit=${sha} \
+            -X github.com/vitalii/a2abridge/internal/buildinfo.BuildDate=${date}" >> "$GITHUB_OUTPUT"
+
+      - name: build
+        run: |
+          out="a2abridge"
+          [ "$GOOS" = "windows" ] && out="a2abridge.exe"
+          mkdir -p dist
+          go build -trimpath -ldflags "${{ steps.ld.outputs.ldflags }}" -o "dist/$out" ./cmd/a2abridge
+
+      - name: pack
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          base="a2abridge_${ver}_${GOOS}_${GOARCH}"
+          cd dist
+          if [ "${{ matrix.ext }}" = "zip" ]; then
+            zip -9 "${base}.zip" a2abridge.exe
+          else
+            tar -czf "${base}.tar.gz" a2abridge
+          fi
+          ls -la
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/a2abridge_*

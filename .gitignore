@@ -1,0 +1,35 @@
+# Build artefacts
+/bin/
+/dist/
+/a2abridge
+*.exe
+
+# Project-local state — bridges write inbox/log here
+/.a2a/
+.a2a/
+
+# Backup files written by `a2abridge install --apply` and friends
+*.bak.*
+
+# Editor & OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Per-developer local IDE state — must not leak personal paths
+.claude/
+.codex/
+.cursor/
+.continue/
+.gemini/
+
+# Coverage
+coverage.out
+coverage.html
+
+# Local TLS material — should NEVER be committed
+/internal/tls/
+*.pem
+*.key
+*.crt

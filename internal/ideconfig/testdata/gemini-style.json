@@ -1,0 +1,7 @@
+{
+  "security": { "auth": { "selectedType": "oauth-personal" } },
+  "_comment": "Gemini-style settings — _comment keys appear as ordinary string keys to encoding/json, not as comments",
+  "core": {
+    "model": "gemini-2.5-pro"
+  }
+}

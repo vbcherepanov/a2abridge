@@ -1,0 +1,21 @@
+{
+  // Claude Code style: top-level env, permissions, then MCP server registry.
+  // Trailing commas are allowed because Claude treats settings.json as JSONC.
+  "env": {
+    "EXAMPLE_VAR": "value",
+  },
+  "permissions": {
+    "allow": [
+      "Read(*)",
+      "Glob(*)",
+    ],
+  },
+  /* a multi-line block comment that should also be stripped
+     by the JSONC pre-processor before encoding/json sees it */
+  "mcpServers": {
+    "example": {
+      "command": "/usr/local/bin/example",
+      "args": ["serve"],
+    },
+  },
+}
