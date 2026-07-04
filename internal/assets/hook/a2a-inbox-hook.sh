@@ -22,7 +22,7 @@ PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
 INBOX=""
 for d in "$PROJECT_DIR/.a2a" "$HOME/.a2abridge/state"/*; do
   [ -d "$d" ] || continue
-  for f in "$d"/inbox-*.json; do
+  for f in "$d"/inbox*.json; do
     [ -s "$f" ] || continue
     INBOX="$f"
     break 2
