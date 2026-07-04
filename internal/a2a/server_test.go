@@ -408,3 +408,20 @@ func TestRPCEndpointIsRootOnly(t *testing.T) {
 		t.Errorf("POST /no/such/path status = %d, want 404", resp.StatusCode)
 	}
 }
+
+// TestMetricsEndpointMounted verifies the bridge exposes /metrics (not only the
+// directory) — without it a bot's /metrics 404s and Eir can't scrape per-bridge
+// stats.
+func TestMetricsEndpointMounted(t *testing.T) {
+	ts := newTestServer(t, &fakeHandler{})
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("/metrics status = %d, want 200 (route not mounted?)", resp.StatusCode)
+	}
+}
