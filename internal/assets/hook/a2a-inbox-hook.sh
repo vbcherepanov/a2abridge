@@ -16,13 +16,15 @@ command -v python3 >/dev/null 2>&1 || exit 0
 
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
 
-# Find a non-empty inbox file. The bridge writes
-#   $CWD/.a2a/inbox-<ppid>.json    (preferred — per project)
-#   ~/.a2abridge/state/<ppid>/inbox-<ppid>.json   (fallback)
+# Find a non-empty inbox file. The bridge writes a single stable
+#   $CWD/.a2a/inbox.json                    (preferred — per project)
+#   ~/.a2abridge/state/<ppid>/inbox.json    (fallback)
+# The glob matches both the stable name and any legacy inbox-<pid>.json still on
+# disk, so an in-flight upgrade has no deaf window.
 INBOX=""
 for d in "$PROJECT_DIR/.a2a" "$HOME/.a2abridge/state"/*; do
   [ -d "$d" ] || continue
-  for f in "$d"/inbox-*.json; do
+  for f in "$d"/inbox*.json; do
     [ -s "$f" ] || continue
     INBOX="$f"
     break 2

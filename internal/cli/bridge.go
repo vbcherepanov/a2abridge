@@ -84,7 +84,7 @@ func RunBridge(args []string, _, stderr io.Writer) int {
 	selfURL := fmt.Sprintf("%s://%s:%d", scheme, *advertiseHost, port)
 
 	store := agent.NewStore()
-	store.InboxPath = filepath.Join(resolvedStateDir, fmt.Sprintf("inbox-%d.json", os.Getppid()))
+	store.InboxPath = filepath.Join(resolvedStateDir, "inbox.json")
 	store.LoadInbox() // durable inbox: restore messages that arrived (and weren't drained) before a restart
 	cwd, _ := os.Getwd()
 
