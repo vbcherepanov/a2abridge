@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -387,5 +388,95 @@ func TestTrimToRuneSafe(t *testing.T) {
 	}
 	if short := trimTo("short", 10); short != "short" {
 		t.Errorf("trimTo(short) = %q", short)
+	}
+}
+
+// TestSendMessageDedupByMessageID verifies effectively-once delivery: a
+// redelivered message (same MessageID) is not queued twice.
+func TestSendMessageDedupByMessageID(t *testing.T) {
+	s := NewStore()
+	params := a2a.MessageSendParams{Message: a2a.Message{
+		MessageID: "dup1", Role: a2a.RoleUser, Parts: []a2a.Part{{Text: "hi"}},
+	}}
+	if _, _, err := s.SendMessage(context.Background(), params); err != nil {
+		t.Fatalf("send 1: %v", err)
+	}
+	if _, _, err := s.SendMessage(context.Background(), params); err != nil {
+		t.Fatalf("send 2 (redelivery): %v", err)
+	}
+	if got := len(s.PeekInbox()); got != 1 {
+		t.Fatalf("inbox size = %d after redelivery, want 1 (dedup)", got)
+	}
+}
+
+// TestLoadInboxRestoresSnapshot verifies durable delivery: messages persisted
+// to the snapshot are restored into a fresh store on startup (survive a bounce),
+// and a reload after drain is empty.
+func TestLoadInboxRestoresSnapshot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "inbox.json")
+
+	s1 := NewStore()
+	s1.InboxPath = path
+	if _, _, err := s1.SendMessage(context.Background(), a2a.MessageSendParams{
+		Message: a2a.Message{
+			MessageID: "keep1", Role: a2a.RoleUser,
+			Parts:    []a2a.Part{{Text: "survive me"}},
+			Metadata: map[string]any{"from": "peer-a"},
+		},
+	}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	// Simulate a bounce: a brand-new store pointed at the same snapshot.
+	s2 := NewStore()
+	s2.InboxPath = path
+	s2.LoadInbox()
+
+	pending := s2.PeekInbox()
+	if len(pending) != 1 {
+		t.Fatalf("restored inbox size = %d, want 1", len(pending))
+	}
+	if pending[0].MessageID != "keep1" {
+		t.Errorf("restored messageId = %q, want keep1", pending[0].MessageID)
+	}
+	if len(pending[0].Parts) == 0 || pending[0].Parts[0].Text != "survive me" {
+		t.Errorf("restored text = %+v, want 'survive me'", pending[0].Parts)
+	}
+	if from, _ := pending[0].Metadata["from"].(string); from != "peer-a" {
+		t.Errorf("restored from = %q, want peer-a", from)
+	}
+
+	// Drain, then a fresh reload of the now-empty snapshot must be a no-op.
+	if drained := s2.DrainInbox(); len(drained) != 1 {
+		t.Fatalf("drain = %d, want 1", len(drained))
+	}
+	s3 := NewStore()
+	s3.InboxPath = path
+	s3.LoadInbox()
+	if got := len(s3.PeekInbox()); got != 0 {
+		t.Fatalf("reload after drain = %d, want 0", got)
+	}
+}
+
+// TestInboxSoftCap verifies the inbox is bounded: past inboxSoftCap the oldest
+// entries are dropped (a stuck/never-drained bridge can't grow without bound).
+func TestInboxSoftCap(t *testing.T) {
+	s := NewStore()
+	total := inboxSoftCap + 25
+	for i := 0; i < total; i++ {
+		if _, _, err := s.SendMessage(context.Background(), a2a.MessageSendParams{
+			Message: a2a.Message{MessageID: fmt.Sprintf("m%05d", i), Role: a2a.RoleUser, Parts: []a2a.Part{{Text: "x"}}},
+		}); err != nil {
+			t.Fatalf("send %d: %v", i, err)
+		}
+	}
+	pending := s.PeekInbox()
+	if len(pending) != inboxSoftCap {
+		t.Fatalf("inbox size = %d, want soft cap %d", len(pending), inboxSoftCap)
+	}
+	// Oldest dropped → first survivor is index (total-cap).
+	want := fmt.Sprintf("m%05d", total-inboxSoftCap)
+	if pending[0].MessageID != want {
+		t.Errorf("oldest survivor = %q, want %q", pending[0].MessageID, want)
 	}
 }

@@ -85,6 +85,7 @@ func RunBridge(args []string, _, stderr io.Writer) int {
 
 	store := agent.NewStore()
 	store.InboxPath = filepath.Join(resolvedStateDir, fmt.Sprintf("inbox-%d.json", os.Getppid()))
+	store.LoadInbox() // durable inbox: restore messages that arrived (and weren't drained) before a restart
 	cwd, _ := os.Getwd()
 
 	responderMode := os.Getenv("A2A_RESPONDER")
@@ -231,7 +232,8 @@ func RunBridge(args []string, _, stderr io.Writer) int {
 
 	<-ctx.Done()
 	log.Info("shutting down")
-	_ = os.Remove(store.InboxPath)
+	// Do NOT delete store.InboxPath on shutdown — the snapshot must survive a
+	// bounce so LoadInbox() can restore undrained messages (durable delivery).
 	shutCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(shutCtx)

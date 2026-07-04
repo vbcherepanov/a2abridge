@@ -24,6 +24,11 @@ import (
 const (
 	terminalTaskTTL = 30 * time.Minute
 	janitorInterval = time.Minute
+
+	// inboxSoftCap bounds the persisted inbox. An inbox is normally drained
+	// every turn; a soft cap keeps a stuck/never-drained bridge from growing
+	// the snapshot without bound. Oldest entries are dropped past this.
+	inboxSoftCap = 500
 )
 
 // Store implements a2a.Handler for a local agent.
@@ -237,10 +242,15 @@ func (s *Store) appendSyntheticReply(p *pendingOutgoingTask, reply, state string
 		Metadata:  map[string]any{"from": p.PeerName, "kind": "outgoing-reply", "state": state},
 	}
 	s.mu.Lock()
-	s.inbox = append(s.inbox, synthetic)
-	s.persistInboxLocked()
+	isNew := s.appendInboxLocked(synthetic)
+	if isNew {
+		s.persistInboxLocked()
+	}
 	cb := s.OnIncoming
 	s.mu.Unlock()
+	if !isNew {
+		return // duplicate reply already queued (poll + SSE race) — don't re-inject or re-fire
+	}
 	if cb != nil {
 		go cb(synthetic)
 	}
@@ -309,6 +319,84 @@ func trimTo(s string, n int) string {
 		return s
 	}
 	return string(r[:n]) + "..."
+}
+
+// inboxContainsLocked reports whether a message with this id is already queued.
+// Must be called with s.mu held.
+func (s *Store) inboxContainsLocked(id string) bool {
+	if id == "" {
+		return false
+	}
+	for i := range s.inbox {
+		if s.inbox[i].MessageID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// appendInboxLocked adds a message to the inbox with effectively-once semantics
+// (dedup by MessageID — a redelivery is dropped) and a soft cap (oldest dropped
+// past inboxSoftCap). Returns true if the message was newly queued, false if it
+// was a duplicate — callers use that to skip re-firing side-effects (hook,
+// responder, metrics). Must be called with s.mu held.
+func (s *Store) appendInboxLocked(m a2a.Message) bool {
+	if s.inboxContainsLocked(m.MessageID) {
+		return false
+	}
+	s.inbox = append(s.inbox, m)
+	if over := len(s.inbox) - inboxSoftCap; over > 0 {
+		s.logger().Warn("inbox soft-cap exceeded, dropping oldest", "cap", inboxSoftCap, "dropped", over)
+		s.inbox = append([]a2a.Message(nil), s.inbox[over:]...)
+	}
+	return true
+}
+
+// LoadInbox repopulates the inbox from the on-disk snapshot at InboxPath,
+// making delivery durable across a bridge restart: messages that arrived but
+// were never drained survive a bounce instead of being lost. Call once at
+// startup, after InboxPath is set. The snapshot is the flat hook-facing
+// projection (persistInboxLocked), so reconstructed messages carry
+// id/task/context/from/text — the fields the drain path + host actually use.
+// Missing/unreadable/empty snapshot = a normal fresh start (no-op).
+func (s *Store) LoadInbox() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.InboxPath == "" {
+		return
+	}
+	b, err := os.ReadFile(s.InboxPath)
+	if err != nil {
+		return // no snapshot yet — fresh bridge
+	}
+	var snap []struct {
+		MessageID string `json:"messageId"`
+		TaskID    string `json:"taskId"`
+		ContextID string `json:"contextId"`
+		From      string `json:"from"`
+		Text      string `json:"text"`
+	}
+	if err := json.Unmarshal(b, &snap); err != nil {
+		s.logger().Warn("inbox snapshot load failed", "path", s.InboxPath, "err", err)
+		return
+	}
+	for _, e := range snap {
+		m := a2a.Message{
+			MessageID: e.MessageID,
+			TaskID:    e.TaskID,
+			ContextID: e.ContextID,
+			Role:      a2a.RoleUser,
+			Parts:     []a2a.Part{{Text: e.Text}},
+		}
+		if e.From != "" {
+			m.Metadata = map[string]any{"from": e.From}
+		}
+		s.appendInboxLocked(m)
+	}
+	metrics.SetInboxSize(len(s.inbox))
+	if len(s.inbox) > 0 {
+		s.logger().Info("inbox restored from snapshot", "count", len(s.inbox), "path", s.InboxPath)
+	}
 }
 
 // persistInboxLocked writes the current inbox to InboxPath atomically.
@@ -400,34 +488,39 @@ func (s *Store) SendMessage(ctx context.Context, p a2a.MessageSendParams) (*a2a.
 	if msg.MessageID == "" {
 		msg.MessageID = uuid.NewString()
 	}
-	task.History = append(task.History, msg)
-	s.inbox = append(s.inbox, msg)
-	s.persistInboxLocked()
-	metrics.IncMessagesReceived()
+	// Effectively-once: a redelivered message (same MessageID) is not
+	// re-queued, and its side-effects (history, hook, responder, metrics)
+	// are not re-fired. The sender still gets a valid task back.
+	isNew := s.appendInboxLocked(msg)
+	if isNew {
+		task.History = append(task.History, msg)
+		s.persistInboxLocked()
+		metrics.IncMessagesReceived()
 
-	if s.OnIncoming != nil {
-		go s.OnIncoming(msg)
-	}
-	// Surface inbound messages to the user's hook directory so external
-	// integrations (desktop notifications, Slack relay, audit log) get a
-	// turn. The hook's payload mirrors the synthetic-reply shape so
-	// scripts can be uniform across both events.
-	from := ""
-	if v, ok := msg.Metadata["from"].(string); ok {
-		from = v
-	}
-	text := ""
-	for _, pt := range msg.Parts {
-		if pt.Text != "" {
-			text = pt.Text
-			break
+		if s.OnIncoming != nil {
+			go s.OnIncoming(msg)
 		}
+		// Surface inbound messages to the user's hook directory so external
+		// integrations (desktop notifications, Slack relay, audit log) get a
+		// turn. The hook's payload mirrors the synthetic-reply shape so
+		// scripts can be uniform across both events.
+		from := ""
+		if v, ok := msg.Metadata["from"].(string); ok {
+			from = v
+		}
+		text := ""
+		for _, pt := range msg.Parts {
+			if pt.Text != "" {
+				text = pt.Text
+				break
+			}
+		}
+		FireHook("on-inbound", map[string]any{
+			"taskId": taskID,
+			"from":   from,
+			"text":   text,
+		})
 	}
-	FireHook("on-inbound", map[string]any{
-		"taskId": taskID,
-		"from":   from,
-		"text":   text,
-	})
 
 	s.notifyLocked(taskID, a2a.StreamResponse{
 		StatusUpdate: &a2a.TaskStatusUpdateEvent{
