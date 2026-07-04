@@ -132,9 +132,20 @@ func RunBridge(args []string, _, stderr io.Writer) int {
 		if nudgeMode == "auto" {
 			nudgeMode = agent.DetectNudgeMode()
 		}
-		if nudgeMode == "" {
+		switch nudgeMode {
+		case "":
 			log.Warn("A2A_NUDGE=auto but no backend detected (not in tmux, not on darwin)")
-		} else {
+		case "dtach":
+			// dtach backend: inject into the supervising dtach master socket.
+			// Socket via A2A_NUDGE_SOCKET, defaulting to ~/.dtach/<name>.
+			socket := os.Getenv("A2A_NUDGE_SOCKET")
+			if socket == "" {
+				socket = filepath.Join(os.Getenv("HOME"), ".dtach", *name)
+			}
+			n := agent.NewDtachNudger(socket, log)
+			store.OnIncoming = n.Handle
+			log.Info("dtach nudger enabled", "socket", socket)
+		default:
 			tty := parentTTY(os.Getppid())
 			if tty == "" {
 				log.Warn("nudge requested but parent TTY unknown, disabled")

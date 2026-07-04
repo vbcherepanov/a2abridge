@@ -33,9 +33,10 @@ func DetectNudgeMode() string {
 // Backends: tmux (preferred when available) and macOS Terminal.app via
 // osascript.
 type Nudger struct {
-	Mode string // "terminal" | "tmux" | ""
-	TTY  string // e.g. "/dev/ttys003"
-	Log  *slog.Logger
+	Mode   string // "terminal" | "tmux" | "dtach" | ""
+	TTY    string // e.g. "/dev/ttys003" (tty backends)
+	Socket string // dtach master socket path (dtach backend)
+	Log    *slog.Logger
 
 	mu          sync.Mutex
 	lastNudgeAt time.Time
@@ -48,6 +49,14 @@ func NewNudger(mode, tty string, log *slog.Logger) *Nudger {
 		tty = "/dev/" + tty
 	}
 	return &Nudger{Mode: mode, TTY: tty, Log: log, coalesceFor: 3 * time.Second}
+}
+
+// NewDtachNudger returns a nudger that wakes the parent by injecting keystrokes
+// into a dtach master socket (dtach -p) — for bots supervised under `dtach -n`
+// rather than a tty/tmux. This lets the bridge's native OnIncoming hook wake the
+// agent directly, an in-process alternative to an external inotify doorbell.
+func NewDtachNudger(socket string, log *slog.Logger) *Nudger {
+	return &Nudger{Mode: "dtach", Socket: socket, Log: log, coalesceFor: 3 * time.Second}
 }
 
 // Handle is meant to be attached to Store.OnIncoming.
@@ -79,6 +88,8 @@ func (n *Nudger) nudge(text string) error {
 		return n.nudgeTerminal(text)
 	case "tmux":
 		return n.nudgeTmux(text)
+	case "dtach":
+		return n.nudgeDtach(text)
 	default:
 		return fmt.Errorf("unknown nudge mode: %s", n.Mode)
 	}
@@ -187,6 +198,35 @@ func (n *Nudger) nudgeTmux(text string) error {
 	cmd.Stderr = &errb
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("tmux send-keys: %w: %s", err, errb.String())
+	}
+	return nil
+}
+
+// nudgeDtach injects the directive into a dtach master socket via `dtach -p`
+// (dtach's send-keys equivalent) — the same mechanism the external a2a-wake
+// watcher uses. The text and the submitting CR are sent as TWO SEPARATE writes:
+// a combined text+CR burst gets paste-coalesced by some TUIs so the CR lands as
+// a literal newline and never submits (the input sits unsent). A short delay
+// between the writes avoids that.
+func (n *Nudger) nudgeDtach(text string) error {
+	if n.Socket == "" {
+		return fmt.Errorf("dtach nudge: no socket configured")
+	}
+	if err := dtachPush(n.Socket, text); err != nil {
+		return err
+	}
+	time.Sleep(250 * time.Millisecond)
+	return dtachPush(n.Socket, "\r")
+}
+
+// dtachPush writes s to the dtach master's attached program via `dtach -p`.
+func dtachPush(socket, s string) error {
+	cmd := exec.Command("dtach", "-p", socket)
+	cmd.Stdin = strings.NewReader(s)
+	var errb bytes.Buffer
+	cmd.Stderr = &errb
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("dtach -p %s: %w: %s", socket, err, errb.String())
 	}
 	return nil
 }
