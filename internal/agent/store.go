@@ -143,6 +143,30 @@ func (s *Store) evictTerminal(now time.Time) int {
 			evicted = append(evicted, id)
 		}
 	}
+	// FIX(stale-re-render): outgoing-reply notifications (MessageID "reply-…") are
+	// one-shot — delivered in real-time via OnIncoming + injected by the wake hook.
+	// The bot never complete_task's its OWN outgoing task IDs, so CompleteTask's
+	// by-taskID drop never reaches them and they re-rendered on every wake. Evict
+	// by IDENTITY (MessageID prefix; `kind` is stripped on-disk) once past the
+	// delivery TTL.
+	if len(s.inbox) > 0 {
+		replyCutoff := now.Add(-2 * time.Minute)
+		kept := s.inbox[:0]
+		for _, m := range s.inbox {
+			if strings.HasPrefix(m.MessageID, "reply-") {
+				if ts, ok := m.Metadata["ts"].(string); ok {
+					if when, err := time.Parse(time.RFC3339, ts); err == nil && when.Before(replyCutoff) {
+						continue // delivered + aged out → drop
+					}
+				}
+			}
+			kept = append(kept, m)
+		}
+		if len(kept) != len(s.inbox) {
+			s.inbox = kept
+			s.persistInboxLocked()
+		}
+	}
 	s.mu.Unlock()
 	for _, id := range evicted {
 		// Empty PushConfigID = delete all webhooks for the task. The
@@ -229,12 +253,19 @@ func extractReplyText(t *a2a.Task) string {
 // poll loop and the SSE fast-path. Holds the lock for as little time as
 // possible and fires OnIncoming outside the critical section.
 func (s *Store) appendSyntheticReply(p *pendingOutgoingTask, reply, state string) {
+	// FIX(empty-arrivals): a contentless completion (peer completed with no reply
+	// text — e.g. a bare a2a_complete_task ack) needs no inbox entry. The terminal
+	// state is already recorded on the task, and an empty "[ОТВЕТ …]" record is just
+	// noise that would feed the never-cleared stale floor — so skip it.
+	if strings.TrimSpace(reply) == "" {
+		return
+	}
 	synthetic := a2a.Message{
 		MessageID: "reply-" + p.TaskID,
 		TaskID:    p.TaskID,
 		Role:      a2a.RoleAgent,
 		Parts:     []a2a.Part{{Text: fmt.Sprintf("[ОТВЕТ от %s на твой вопрос «%s»]\n%s", p.PeerName, trimTo(p.Question, 80), reply)}},
-		Metadata:  map[string]any{"from": p.PeerName, "kind": "outgoing-reply", "state": state},
+		Metadata:  map[string]any{"from": p.PeerName, "kind": "outgoing-reply", "state": state, "ts": time.Now().UTC().Format(time.RFC3339)},
 	}
 	s.mu.Lock()
 	s.inbox = append(s.inbox, synthetic)
@@ -566,6 +597,26 @@ func (s *Store) PeekInbox() []a2a.Message {
 	defer s.mu.Unlock()
 	out := make([]a2a.Message, len(s.inbox))
 	copy(out, s.inbox)
+	// FIX(wake-spam): outgoing-reply notifications (MessageID "reply-…") are
+	// one-shot. A bot that PEEKs (instead of draining) would otherwise leave them
+	// in s.inbox, re-surfacing them on every wake until the janitor TTL — the
+	// residual wake-spam. Consume them on read: the caller gets them in `out`
+	// this once, then they're gone (DrainInbox already clears all; this makes
+	// peek consume the one-shot replies too). Genuine incoming task messages
+	// are untouched, so peeking pending tasks stays non-destructive.
+	kept := s.inbox[:0]
+	dropped := false
+	for _, m := range s.inbox {
+		if strings.HasPrefix(m.MessageID, "reply-") {
+			dropped = true
+			continue
+		}
+		kept = append(kept, m)
+	}
+	if dropped {
+		s.inbox = kept
+		s.persistInboxLocked()
+	}
 	return out
 }
 
@@ -574,19 +625,32 @@ func (s *Store) PeekInbox() []a2a.Message {
 func (s *Store) CompleteTask(taskID, replyText string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Drop inbox entries for this task before the s.tasks lookup. A synthetic
+	// outgoing-reply carries an outgoing task id that is absent from s.tasks,
+	// so the earlier ErrTaskNotFound return skipped this drop and the entry
+	// lingered in the inbox snapshot.
+	filtered := s.inbox[:0]
+	dropped := false
+	for _, m := range s.inbox {
+		if m.TaskID == taskID {
+			dropped = true
+			continue
+		}
+		filtered = append(filtered, m)
+	}
+	if dropped {
+		s.inbox = filtered
+		s.persistInboxLocked()
+	}
+
 	t, ok := s.tasks[taskID]
 	if !ok {
+		if dropped {
+			// cleared a synthetic outgoing-reply; nothing else to complete
+			return nil
+		}
 		return a2a.ErrTaskNotFound
 	}
-	// drop inbox entries for this task
-	filtered := s.inbox[:0]
-	for _, m := range s.inbox {
-		if m.TaskID != taskID {
-			filtered = append(filtered, m)
-		}
-	}
-	s.inbox = filtered
-	s.persistInboxLocked()
 	reply := a2a.Message{
 		MessageID: uuid.NewString(),
 		ContextID: t.ContextID,

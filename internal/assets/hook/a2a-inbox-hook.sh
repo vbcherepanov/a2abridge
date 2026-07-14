@@ -16,13 +16,27 @@ command -v python3 >/dev/null 2>&1 || exit 0
 
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
 
-# Find a non-empty inbox file. The bridge writes
+# Find the LIVE inbox file. The bridge writes inbox-<ppid>.json (ppid = the
+# bridge's parent = this claude). On a claude relaunch the OLD inbox-<oldpid>.json
+# lingers; if it still holds leftover records, the previous first-non-empty glob
+# fixated on the STALE file and never surfaced genuine inbound sitting in the
+# live-PID file (the "wake fires but the pending message isn't rendered" bug).
+# Fix: skip + prune inbox files whose <pid> is no longer a running process, and
+# pick a LIVE-pid non-empty inbox.
 #   $CWD/.a2a/inbox-<ppid>.json    (preferred — per project)
 #   ~/.a2abridge/state/<ppid>/inbox-<ppid>.json   (fallback)
 INBOX=""
 for d in "$PROJECT_DIR/.a2a" "$HOME/.a2abridge/state"/*; do
   [ -d "$d" ] || continue
   for f in "$d"/inbox-*.json; do
+    [ -e "$f" ] || continue
+    pid="${f##*/inbox-}"; pid="${pid%.json}"
+    # Prune a stale-PID inbox (its owning bridge process is gone) — left in place
+    # it shadows the live inbox and genuine inbound never surfaces on the wake.
+    if [ -n "$pid" ] && [ "$pid" -eq "$pid" ] 2>/dev/null && ! kill -0 "$pid" 2>/dev/null; then
+      rm -f "$f" 2>/dev/null
+      continue
+    fi
     [ -s "$f" ] || continue
     INBOX="$f"
     break 2
