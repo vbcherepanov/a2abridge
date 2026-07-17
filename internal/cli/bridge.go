@@ -69,10 +69,31 @@ func RunBridge(args []string, _, stderr io.Writer) int {
 	}
 	log := slog.New(h).With("agent", *name, "id", *idFlag, "state_dir", resolvedStateDir)
 
-	ln, err := net.Listen("tcp", *bindAddr)
-	if err != nil {
-		log.Error("listen", "err", err)
-		return 1
+	// Bind is also our singleton lock. On a fast parent restart the previous
+	// bridge may still be releasing this port for a few hundred milliseconds, so
+	// retry a bounded number of times to let the new bridge win once the old one
+	// lets go. If the port is STILL held after the grace window, another bridge
+	// already serves this agent — defer to it and exit cleanly (0) rather than
+	// erroring or running portless, so exactly one bridge exists per agent.
+	// Combined with the pdeathsig/stdin-EOF shutdown above, a stale incumbent is
+	// already gone and a surviving one is the legitimate owner. Non-EADDRINUSE
+	// bind errors are real failures and are not retried.
+	var ln net.Listener
+	for attempt := 0; ; attempt++ {
+		ln, err = net.Listen("tcp", *bindAddr)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, syscall.EADDRINUSE) {
+			log.Error("listen", "err", err)
+			return 1
+		}
+		if attempt >= 10 {
+			log.Info("listen: port already held by another bridge, deferring", "addr", *bindAddr)
+			return 0
+		}
+		log.Warn("listen: address in use, retrying", "attempt", attempt+1)
+		time.Sleep(300 * time.Millisecond)
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
 
@@ -118,6 +139,15 @@ func RunBridge(args []string, _, stderr io.Writer) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Die with our parent: if the MCP host (e.g. claude) exits, this bridge must
+	// shut down and release its port rather than orphaning to init (ppid 1) and
+	// squatting the port so the next bridge cannot bind ("address already in
+	// use"), which silently kills the agent's outbound send path. On Linux this
+	// arms PR_SET_PDEATHSIG(SIGTERM), delivered by the kernel the moment the
+	// parent dies and routed into the handler above; on other platforms it is a
+	// no-op and we rely on the stdin-EOF shutdown below (ServeStdio returning).
+	setParentDeathSignal(log)
 
 	if responderMode != "" {
 		r, rerr := agent.NewResponder(responderMode, card, store, log)
@@ -223,10 +253,15 @@ func RunBridge(args []string, _, stderr io.Writer) int {
 
 	go func() {
 		log.Info("mcp stdio server starting")
+		// ServeStdio reads os.Stdin and returns when it closes — which happens
+		// when the parent (MCP host) goes away. Always shut the bridge down when
+		// it returns, even on a clean EOF (err == nil), so the bridge never
+		// outlives its parent while still holding the port.
 		if err := server.ServeStdio(mcpSrv); err != nil {
 			log.Error("mcp serve", "err", err)
-			stop()
 		}
+		log.Info("mcp stdio server exited, shutting down bridge")
+		stop()
 	}()
 
 	<-ctx.Done()
