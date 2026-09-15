@@ -4,6 +4,15 @@ All notable changes to a2abridge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Antigravity CLI (`agy`) support: `a2abridge install` detects it by
+  `~/.gemini/config/mcp_config.json` or `~/.gemini/antigravity-cli` and
+  writes the MCP block to `mcp_config.json`; `uninstall` and `doctor` cover
+  it too (`--ide antigravity`) (#19).
+
 ## [3.1.0] — 2026-09-15
 
 Reliability release built on community fixes by

@@ -48,6 +48,7 @@ func TestWriterSlugCanonical(t *testing.T) {
 		"Cline (VS Code)": "cline",
 		"Continue":        "continue",
 		"Gemini CLI":      "gemini",
+		"Antigravity CLI": "antigravity",
 	}
 	for _, w := range ideconfig.AllWriters() {
 		want, ok := cases[w.Name()]

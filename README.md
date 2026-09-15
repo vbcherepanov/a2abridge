@@ -24,7 +24,7 @@ Foundation standard.
 
 ## The pain it solves
 
-You have several AI coding agents on the same machine: Claude in the IDE, Claude in a terminal, Codex CLI, Cursor, maybe Cline or Gemini CLI. They are **isolated by default**. There is no built-in way for "Codex finished refactoring the API" to reach the Claude session that owns the frontend, except you copy-pasting between windows.
+You have several AI coding agents on the same machine: Claude in the IDE, Claude in a terminal, Codex CLI, Cursor, maybe Cline, Gemini CLI or Antigravity CLI. They are **isolated by default**. There is no built-in way for "Codex finished refactoring the API" to reach the Claude session that owns the frontend, except you copy-pasting between windows.
 
 Existing solutions are either:
 
@@ -151,6 +151,7 @@ iwr -useb https://raw.githubusercontent.com/<owner>/a2abridge/main/install.ps1 |
    - Continue → `~/.continue/config.json`
    - Cursor → `~/.cursor/mcp.json`
    - Gemini CLI → `~/.gemini/settings.json`
+   - Antigravity CLI → `~/.gemini/config/mcp_config.json`
 4. Registers `a2abridge directory` as a user-level system service (`launchd` / `systemd --user` / Windows Service) and starts it on `127.0.0.1:7777`.
 5. Installs the `a2a-bridge` skill into `~/.claude/skills/a2a-bridge/` and adds `~/.claude/hooks/a2a-inbox-hook.sh` (so other agents' messages show up in your prompt).
 6. Runs `a2abridge doctor` to verify everything is healthy.
@@ -313,6 +314,15 @@ Continue 1.x reads MCP servers from
 
 Same `mcpServers` shape as Claude Code. After a restart, `gemini /mcp`
 will list the `a2a` server.
+
+### Antigravity CLI (`~/.gemini/config/mcp_config.json`)
+
+Antigravity CLI (`agy`) reads MCP servers from its own file, not from Gemini
+CLI's `settings.json`. The installer detects agy by that file or by its state
+directory `~/.gemini/antigravity-cli` and writes the same `mcpServers` block;
+run `/mcp` inside agy to confirm the `a2a` server. Antigravity keeps cached
+copies of MCP servers under `~/.gemini/antigravity-cli/mcp/` — after
+`a2abridge uninstall`, remove the `a2a` copy there as well.
 
 ### Two instances of the same IDE on the same host
 
@@ -492,6 +502,7 @@ Metrics: the directory and every bridge serve Prometheus metrics at `/metrics`.
 | Continue | `~/.continue/config.json` | yes |
 | Cursor | `~/.cursor/mcp.json` | yes |
 | Gemini CLI | `~/.gemini/settings.json` | yes |
+| Antigravity CLI | `~/.gemini/config/mcp_config.json` | best-effort |
 | Aider | `aider.conf.yml` (bridge mode) | best-effort |
 | Any A2A 1.0 peer | direct JSON-RPC | yes |
 

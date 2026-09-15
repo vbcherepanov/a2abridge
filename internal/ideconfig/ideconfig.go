@@ -90,6 +90,7 @@ func AllWriters() []Writer {
 		&clineWriter{},
 		&continueWriter{},
 		&geminiWriter{},
+		&antigravityWriter{},
 	}
 }
 
@@ -108,8 +109,9 @@ func WriterFound(w Writer) bool {
 
 // RemoveMCPEntry strips the "a2a" key from the writer's config — used
 // by `a2abridge uninstall`. The implementation is writer-agnostic for
-// JSON-based IDEs (Claude Code, Cursor, Cline, Gemini); Codex (TOML) and
-// Continue (own file) are handled by special cases below.
+// JSON-based IDEs (Claude Code, Cursor, Cline, Gemini); Codex (TOML),
+// Continue (own file) and Antigravity (marker directory) are handled by
+// special cases below.
 func RemoveMCPEntry(w Writer, path string) error {
 	if path == "" {
 		return nil
@@ -119,6 +121,9 @@ func RemoveMCPEntry(w Writer, path string) error {
 		return removeCodexEntry(path)
 	case *continueWriter:
 		return removeContinueFile(path)
+	case *antigravityWriter:
+		// Detect may return the CLI state directory; the entry lives in mcp_config.json.
+		return removeJSONMCPEntry(antigravityWriter{}.writeTarget())
 	case *claudeCodeWriter:
 		// Claude Code spans two files (~/.claude.json + ~/.claude/settings.json)
 		// — clean both, including legacy entries from older a2abridge versions.
