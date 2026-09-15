@@ -63,7 +63,7 @@ func RunDoctor(args []string, stdout, stderr io.Writer) int {
 
 	fmt.Fprintln(stdout)
 	fmt.Fprintf(stdout, "platform: %s/%s, go: %s, a2abridge: %s\n",
-		runtime.GOOS, runtime.GOARCH, runtime.Version(), buildinfo.Version)
+		runtime.GOOS, runtime.GOARCH, runtime.Version(), buildinfo.Get().Version)
 
 	if worst == "FAIL" {
 		return 1

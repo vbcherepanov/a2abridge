@@ -89,7 +89,7 @@ func printUsage(w io.Writer) {
 	sort.Strings(names)
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "a2abridge %s — A2A 1.0 protocol bridge for AI coding agents\n\n", buildinfo.Version)
+	fmt.Fprintf(&b, "a2abridge %s — A2A 1.0 protocol bridge for AI coding agents\n\n", buildinfo.Get().Version)
 	b.WriteString("Usage:\n")
 	b.WriteString("  a2abridge <command> [flags]\n\n")
 	b.WriteString("Commands:\n")

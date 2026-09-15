@@ -29,6 +29,9 @@ func TestCompareVersions(t *testing.T) {
 		{"0.3.0-dev", "v0.3.0", -1, true}, // prerelease < release
 		{"v0.3.0", "0.3.0-rc1", 1, true},
 		{"0.3.0-rc1", "0.3.0-rc2", -1, true},
+		{"4.0.0+dirty", "v4.0.0", 0, true},                          // build metadata ignored
+		{"4.0.1-0.20260915120000-abcdef123456", "v4.0.1", -1, true}, // pseudo-version < its release
+		{"4.0.1-0.20260915120000-abcdef123456", "v4.0.0", 1, true},
 		{"dev", "v0.3.0", 0, false},
 		{"v0.3.0", "garbage", 0, false},
 		{"", "v0.3.0", 0, false},
