@@ -24,6 +24,11 @@ import (
 const (
 	terminalTaskTTL = 30 * time.Minute
 	janitorInterval = time.Minute
+
+	// inboxSoftCap bounds the persisted inbox. An inbox is normally drained
+	// every turn; a soft cap keeps a stuck/never-drained bridge from growing
+	// the snapshot without bound. Oldest entries are dropped past this.
+	inboxSoftCap = 500
 )
 
 // Store implements a2a.Handler for a local agent.
@@ -143,6 +148,30 @@ func (s *Store) evictTerminal(now time.Time) int {
 			evicted = append(evicted, id)
 		}
 	}
+	// FIX(stale-re-render): outgoing-reply notifications (MessageID "reply-…") are
+	// one-shot — delivered in real-time via OnIncoming + injected by the wake hook.
+	// The bot never complete_task's its OWN outgoing task IDs, so CompleteTask's
+	// by-taskID drop never reaches them and they re-rendered on every wake. Evict
+	// by IDENTITY (MessageID prefix; `kind` is stripped on-disk) once past the
+	// delivery TTL.
+	if len(s.inbox) > 0 {
+		replyCutoff := now.Add(-2 * time.Minute)
+		kept := s.inbox[:0]
+		for _, m := range s.inbox {
+			if strings.HasPrefix(m.MessageID, "reply-") {
+				if ts, ok := m.Metadata["ts"].(string); ok {
+					if when, err := time.Parse(time.RFC3339, ts); err == nil && when.Before(replyCutoff) {
+						continue // delivered + aged out → drop
+					}
+				}
+			}
+			kept = append(kept, m)
+		}
+		if len(kept) != len(s.inbox) {
+			s.inbox = kept
+			s.persistInboxLocked()
+		}
+	}
 	s.mu.Unlock()
 	for _, id := range evicted {
 		// Empty PushConfigID = delete all webhooks for the task. The
@@ -229,18 +258,30 @@ func extractReplyText(t *a2a.Task) string {
 // poll loop and the SSE fast-path. Holds the lock for as little time as
 // possible and fires OnIncoming outside the critical section.
 func (s *Store) appendSyntheticReply(p *pendingOutgoingTask, reply, state string) {
+	// FIX(empty-arrivals): a contentless completion (peer completed with no reply
+	// text — e.g. a bare a2a_complete_task ack) needs no inbox entry. The terminal
+	// state is already recorded on the task, and an empty "[ОТВЕТ …]" record is just
+	// noise that would feed the never-cleared stale floor — so skip it.
+	if strings.TrimSpace(reply) == "" {
+		return
+	}
 	synthetic := a2a.Message{
 		MessageID: "reply-" + p.TaskID,
 		TaskID:    p.TaskID,
 		Role:      a2a.RoleAgent,
 		Parts:     []a2a.Part{{Text: fmt.Sprintf("[ОТВЕТ от %s на твой вопрос «%s»]\n%s", p.PeerName, trimTo(p.Question, 80), reply)}},
-		Metadata:  map[string]any{"from": p.PeerName, "kind": "outgoing-reply", "state": state},
+		Metadata:  map[string]any{"from": p.PeerName, "kind": "outgoing-reply", "state": state, "ts": time.Now().UTC().Format(time.RFC3339)},
 	}
 	s.mu.Lock()
-	s.inbox = append(s.inbox, synthetic)
-	s.persistInboxLocked()
+	isNew := s.appendInboxLocked(synthetic)
+	if isNew {
+		s.persistInboxLocked()
+	}
 	cb := s.OnIncoming
 	s.mu.Unlock()
+	if !isNew {
+		return // duplicate reply already queued (poll + SSE race) — don't re-inject or re-fire
+	}
 	if cb != nil {
 		go cb(synthetic)
 	}
@@ -311,6 +352,92 @@ func trimTo(s string, n int) string {
 	return string(r[:n]) + "..."
 }
 
+// inboxContainsLocked reports whether a message with this id is already queued.
+// Must be called with s.mu held.
+func (s *Store) inboxContainsLocked(id string) bool {
+	if id == "" {
+		return false
+	}
+	for i := range s.inbox {
+		if s.inbox[i].MessageID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// appendInboxLocked adds a message to the inbox with effectively-once semantics
+// (dedup by MessageID — a redelivery is dropped) and a soft cap (oldest dropped
+// past inboxSoftCap). Returns true if the message was newly queued, false if it
+// was a duplicate — callers use that to skip re-firing side-effects (hook,
+// responder, metrics). Must be called with s.mu held.
+func (s *Store) appendInboxLocked(m a2a.Message) bool {
+	if s.inboxContainsLocked(m.MessageID) {
+		return false
+	}
+	s.inbox = append(s.inbox, m)
+	if over := len(s.inbox) - inboxSoftCap; over > 0 {
+		s.logger().Warn("inbox soft-cap exceeded, dropping oldest", "cap", inboxSoftCap, "dropped", over)
+		s.inbox = append([]a2a.Message(nil), s.inbox[over:]...)
+	}
+	return true
+}
+
+// LoadInbox repopulates the inbox from the on-disk snapshot at InboxPath,
+// making delivery durable across a bridge restart: messages that arrived but
+// were never drained survive a bounce instead of being lost. Call once at
+// startup, after InboxPath is set. The snapshot is the flat hook-facing
+// projection (persistInboxLocked), so reconstructed messages carry
+// id/task/context/from/text — the fields the drain path + host actually use.
+// Missing/unreadable/empty snapshot = a normal fresh start (no-op).
+func (s *Store) LoadInbox() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.InboxPath == "" {
+		return
+	}
+	b, err := os.ReadFile(s.InboxPath)
+	if err != nil {
+		return // no snapshot yet — fresh bridge
+	}
+	var snap []struct {
+		MessageID string `json:"messageId"`
+		TaskID    string `json:"taskId"`
+		ContextID string `json:"contextId"`
+		From      string `json:"from"`
+		Text      string `json:"text"`
+		TS        string `json:"ts"`
+	}
+	if err := json.Unmarshal(b, &snap); err != nil {
+		s.logger().Warn("inbox snapshot load failed", "path", s.InboxPath, "err", err)
+		return
+	}
+	for _, e := range snap {
+		m := a2a.Message{
+			MessageID: e.MessageID,
+			TaskID:    e.TaskID,
+			ContextID: e.ContextID,
+			Role:      a2a.RoleUser,
+			Parts:     []a2a.Part{{Text: e.Text}},
+		}
+		meta := map[string]any{}
+		if e.From != "" {
+			meta["from"] = e.From
+		}
+		if e.TS != "" {
+			meta["ts"] = e.TS
+		}
+		if len(meta) > 0 {
+			m.Metadata = meta
+		}
+		s.appendInboxLocked(m)
+	}
+	metrics.SetInboxSize(len(s.inbox))
+	if len(s.inbox) > 0 {
+		s.logger().Info("inbox restored from snapshot", "count", len(s.inbox), "path", s.InboxPath)
+	}
+}
+
 // persistInboxLocked writes the current inbox to InboxPath atomically.
 // Must be called with s.mu held.
 func (s *Store) persistInboxLocked() {
@@ -335,13 +462,19 @@ func (s *Store) persistInboxLocked() {
 				from = v
 			}
 		}
-		snap = append(snap, map[string]any{
+		entry := map[string]any{
 			"messageId": m.MessageID,
 			"taskId":    m.TaskID,
 			"contextId": m.ContextID,
 			"from":      from,
 			"text":      text,
-		})
+		}
+		// The delivery timestamp lets evictTerminal age out one-shot
+		// outgoing-reply records restored after a bridge restart.
+		if ts, ok := m.Metadata["ts"].(string); ok && ts != "" {
+			entry["ts"] = ts
+		}
+		snap = append(snap, entry)
 	}
 	b, err := json.Marshal(snap)
 	if err != nil {
@@ -400,34 +533,39 @@ func (s *Store) SendMessage(ctx context.Context, p a2a.MessageSendParams) (*a2a.
 	if msg.MessageID == "" {
 		msg.MessageID = uuid.NewString()
 	}
-	task.History = append(task.History, msg)
-	s.inbox = append(s.inbox, msg)
-	s.persistInboxLocked()
-	metrics.IncMessagesReceived()
+	// Effectively-once: a redelivered message (same MessageID) is not
+	// re-queued, and its side-effects (history, hook, responder, metrics)
+	// are not re-fired. The sender still gets a valid task back.
+	isNew := s.appendInboxLocked(msg)
+	if isNew {
+		task.History = append(task.History, msg)
+		s.persistInboxLocked()
+		metrics.IncMessagesReceived()
 
-	if s.OnIncoming != nil {
-		go s.OnIncoming(msg)
-	}
-	// Surface inbound messages to the user's hook directory so external
-	// integrations (desktop notifications, Slack relay, audit log) get a
-	// turn. The hook's payload mirrors the synthetic-reply shape so
-	// scripts can be uniform across both events.
-	from := ""
-	if v, ok := msg.Metadata["from"].(string); ok {
-		from = v
-	}
-	text := ""
-	for _, pt := range msg.Parts {
-		if pt.Text != "" {
-			text = pt.Text
-			break
+		if s.OnIncoming != nil {
+			go s.OnIncoming(msg)
 		}
+		// Surface inbound messages to the user's hook directory so external
+		// integrations (desktop notifications, Slack relay, audit log) get a
+		// turn. The hook's payload mirrors the synthetic-reply shape so
+		// scripts can be uniform across both events.
+		from := ""
+		if v, ok := msg.Metadata["from"].(string); ok {
+			from = v
+		}
+		text := ""
+		for _, pt := range msg.Parts {
+			if pt.Text != "" {
+				text = pt.Text
+				break
+			}
+		}
+		FireHook("on-inbound", map[string]any{
+			"taskId": taskID,
+			"from":   from,
+			"text":   text,
+		})
 	}
-	FireHook("on-inbound", map[string]any{
-		"taskId": taskID,
-		"from":   from,
-		"text":   text,
-	})
 
 	s.notifyLocked(taskID, a2a.StreamResponse{
 		StatusUpdate: &a2a.TaskStatusUpdateEvent{
@@ -566,6 +704,26 @@ func (s *Store) PeekInbox() []a2a.Message {
 	defer s.mu.Unlock()
 	out := make([]a2a.Message, len(s.inbox))
 	copy(out, s.inbox)
+	// FIX(wake-spam): outgoing-reply notifications (MessageID "reply-…") are
+	// one-shot. A bot that PEEKs (instead of draining) would otherwise leave them
+	// in s.inbox, re-surfacing them on every wake until the janitor TTL — the
+	// residual wake-spam. Consume them on read: the caller gets them in `out`
+	// this once, then they're gone (DrainInbox already clears all; this makes
+	// peek consume the one-shot replies too). Genuine incoming task messages
+	// are untouched, so peeking pending tasks stays non-destructive.
+	kept := s.inbox[:0]
+	dropped := false
+	for _, m := range s.inbox {
+		if strings.HasPrefix(m.MessageID, "reply-") {
+			dropped = true
+			continue
+		}
+		kept = append(kept, m)
+	}
+	if dropped {
+		s.inbox = kept
+		s.persistInboxLocked()
+	}
 	return out
 }
 
@@ -574,19 +732,32 @@ func (s *Store) PeekInbox() []a2a.Message {
 func (s *Store) CompleteTask(taskID, replyText string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Drop inbox entries for this task before the s.tasks lookup. A synthetic
+	// outgoing-reply carries an outgoing task id that is absent from s.tasks,
+	// so the earlier ErrTaskNotFound return skipped this drop and the entry
+	// lingered in the inbox snapshot.
+	filtered := s.inbox[:0]
+	dropped := false
+	for _, m := range s.inbox {
+		if m.TaskID == taskID {
+			dropped = true
+			continue
+		}
+		filtered = append(filtered, m)
+	}
+	if dropped {
+		s.inbox = filtered
+		s.persistInboxLocked()
+	}
+
 	t, ok := s.tasks[taskID]
 	if !ok {
+		if dropped {
+			// cleared a synthetic outgoing-reply; nothing else to complete
+			return nil
+		}
 		return a2a.ErrTaskNotFound
 	}
-	// drop inbox entries for this task
-	filtered := s.inbox[:0]
-	for _, m := range s.inbox {
-		if m.TaskID != taskID {
-			filtered = append(filtered, m)
-		}
-	}
-	s.inbox = filtered
-	s.persistInboxLocked()
 	reply := a2a.Message{
 		MessageID: uuid.NewString(),
 		ContextID: t.ContextID,

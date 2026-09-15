@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/vbcherepanov/a2abridge/internal/metrics"
 )
 
 // Handler implements the business logic behind A2A RPC methods.
@@ -50,6 +52,10 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("ok"))
 	})
+	// Per-bridge metrics (inbox_size, messages_received, tasks_failed, ...).
+	// The directory already mounts this; without it here a bot's /metrics 404s,
+	// so Eir can't scrape per-bridge stats.
+	mux.Handle("GET /metrics", metrics.Handler())
 	// {$} pins the JSON-RPC endpoint to exactly "/" so mistyped REST paths
 	// get a proper 404 from the mux instead of falling into the dispatcher.
 	mux.HandleFunc("POST /{$}", s.handleRPC)

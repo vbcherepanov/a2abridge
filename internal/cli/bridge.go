@@ -69,10 +69,31 @@ func RunBridge(args []string, _, stderr io.Writer) int {
 	}
 	log := slog.New(h).With("agent", *name, "id", *idFlag, "state_dir", resolvedStateDir)
 
-	ln, err := net.Listen("tcp", *bindAddr)
-	if err != nil {
-		log.Error("listen", "err", err)
-		return 1
+	// Bind is also our singleton lock. On a fast parent restart the previous
+	// bridge may still be releasing this port for a few hundred milliseconds, so
+	// retry a bounded number of times to let the new bridge win once the old one
+	// lets go. If the port is STILL held after the grace window, another bridge
+	// already serves this agent — defer to it and exit cleanly (0) rather than
+	// erroring or running portless, so exactly one bridge exists per agent.
+	// Combined with the pdeathsig/stdin-EOF shutdown above, a stale incumbent is
+	// already gone and a surviving one is the legitimate owner. Non-EADDRINUSE
+	// bind errors are real failures and are not retried.
+	var ln net.Listener
+	for attempt := 0; ; attempt++ {
+		ln, err = net.Listen("tcp", *bindAddr)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, syscall.EADDRINUSE) {
+			log.Error("listen", "err", err)
+			return 1
+		}
+		if attempt >= 10 {
+			log.Info("listen: port already held by another bridge, deferring", "addr", *bindAddr)
+			return 0
+		}
+		log.Warn("listen: address in use, retrying", "attempt", attempt+1)
+		time.Sleep(300 * time.Millisecond)
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
 
@@ -84,7 +105,8 @@ func RunBridge(args []string, _, stderr io.Writer) int {
 	selfURL := fmt.Sprintf("%s://%s:%d", scheme, *advertiseHost, port)
 
 	store := agent.NewStore()
-	store.InboxPath = filepath.Join(resolvedStateDir, fmt.Sprintf("inbox-%d.json", os.Getppid()))
+	store.InboxPath = filepath.Join(resolvedStateDir, "inbox.json")
+	store.LoadInbox() // durable inbox: restore messages that arrived (and weren't drained) before a restart
 	cwd, _ := os.Getwd()
 
 	responderMode := os.Getenv("A2A_RESPONDER")
@@ -119,6 +141,15 @@ func RunBridge(args []string, _, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Die with our parent: if the MCP host (e.g. claude) exits, this bridge must
+	// shut down and release its port rather than orphaning to init (ppid 1) and
+	// squatting the port so the next bridge cannot bind ("address already in
+	// use"), which silently kills the agent's outbound send path. On Linux this
+	// arms PR_SET_PDEATHSIG(SIGTERM), delivered by the kernel the moment the
+	// parent dies and routed into the handler above; on other platforms it is a
+	// no-op and we rely on the stdin-EOF shutdown below (ServeStdio returning).
+	setParentDeathSignal(log)
+
 	if responderMode != "" {
 		r, rerr := agent.NewResponder(responderMode, card, store, log)
 		if rerr != nil {
@@ -132,9 +163,20 @@ func RunBridge(args []string, _, stderr io.Writer) int {
 		if nudgeMode == "auto" {
 			nudgeMode = agent.DetectNudgeMode()
 		}
-		if nudgeMode == "" {
+		switch nudgeMode {
+		case "":
 			log.Warn("A2A_NUDGE=auto but no backend detected (not in tmux, not on darwin)")
-		} else {
+		case "dtach":
+			// dtach backend: inject into the supervising dtach master socket.
+			// Socket via A2A_NUDGE_SOCKET, defaulting to ~/.dtach/<name>.
+			socket := os.Getenv("A2A_NUDGE_SOCKET")
+			if socket == "" {
+				socket = filepath.Join(os.Getenv("HOME"), ".dtach", *name)
+			}
+			n := agent.NewDtachNudger(socket, log)
+			store.OnIncoming = n.Handle
+			log.Info("dtach nudger enabled", "socket", socket)
+		default:
 			tty := parentTTY(os.Getppid())
 			if tty == "" {
 				log.Warn("nudge requested but parent TTY unknown, disabled")
@@ -223,15 +265,21 @@ func RunBridge(args []string, _, stderr io.Writer) int {
 
 	go func() {
 		log.Info("mcp stdio server starting")
+		// ServeStdio reads os.Stdin and returns when it closes — which happens
+		// when the parent (MCP host) goes away. Always shut the bridge down when
+		// it returns, even on a clean EOF (err == nil), so the bridge never
+		// outlives its parent while still holding the port.
 		if err := server.ServeStdio(mcpSrv); err != nil {
 			log.Error("mcp serve", "err", err)
-			stop()
 		}
+		log.Info("mcp stdio server exited, shutting down bridge")
+		stop()
 	}()
 
 	<-ctx.Done()
 	log.Info("shutting down")
-	_ = os.Remove(store.InboxPath)
+	// Do NOT delete store.InboxPath on shutdown — the snapshot must survive a
+	// bounce so LoadInbox() can restore undrained messages (durable delivery).
 	shutCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(shutCtx)

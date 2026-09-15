@@ -16,13 +16,26 @@ command -v python3 >/dev/null 2>&1 || exit 0
 
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
 
-# Find a non-empty inbox file. The bridge writes
-#   $CWD/.a2a/inbox-<ppid>.json    (preferred — per project)
-#   ~/.a2abridge/state/<ppid>/inbox-<ppid>.json   (fallback)
+# Find a non-empty inbox file. The bridge writes a single stable
+#   $CWD/.a2a/inbox.json                    (preferred — per project)
+#   ~/.a2abridge/state/<ppid>/inbox.json    (fallback)
+# Legacy inbox-<pid>.json files left by older bridges are still read during an
+# upgrade, but one whose owning process is gone is pruned: left in place it
+# shadows the live inbox and genuine inbound never surfaces on the wake.
 INBOX=""
 for d in "$PROJECT_DIR/.a2a" "$HOME/.a2abridge/state"/*; do
   [ -d "$d" ] || continue
-  for f in "$d"/inbox-*.json; do
+  for f in "$d"/inbox*.json; do
+    [ -e "$f" ] || continue
+    case "${f##*/}" in
+      inbox-*.json)
+        pid="${f##*/inbox-}"; pid="${pid%.json}"
+        if [ -n "$pid" ] && [ "$pid" -eq "$pid" ] 2>/dev/null && ! kill -0 "$pid" 2>/dev/null; then
+          rm -f "$f" 2>/dev/null
+          continue
+        fi
+        ;;
+    esac
     [ -s "$f" ] || continue
     INBOX="$f"
     break 2

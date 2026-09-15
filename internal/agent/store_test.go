@@ -3,9 +3,11 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -391,5 +393,275 @@ func TestTrimToRuneSafe(t *testing.T) {
 	}
 	if short := trimTo("short", 10); short != "short" {
 		t.Errorf("trimTo(short) = %q", short)
+	}
+}
+
+// TestSendMessageDedupByMessageID verifies effectively-once delivery: a
+// redelivered message (same MessageID) is not queued twice.
+func TestSendMessageDedupByMessageID(t *testing.T) {
+	s := NewStore()
+	params := a2a.MessageSendParams{Message: a2a.Message{
+		MessageID: "dup1", Role: a2a.RoleUser, Parts: []a2a.Part{{Text: "hi"}},
+	}}
+	if _, _, err := s.SendMessage(context.Background(), params); err != nil {
+		t.Fatalf("send 1: %v", err)
+	}
+	if _, _, err := s.SendMessage(context.Background(), params); err != nil {
+		t.Fatalf("send 2 (redelivery): %v", err)
+	}
+	if got := len(s.PeekInbox()); got != 1 {
+		t.Fatalf("inbox size = %d after redelivery, want 1 (dedup)", got)
+	}
+}
+
+// TestLoadInboxRestoresSnapshot verifies durable delivery: messages persisted
+// to the snapshot are restored into a fresh store on startup (survive a bounce),
+// and a reload after drain is empty.
+func TestLoadInboxRestoresSnapshot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "inbox.json")
+
+	s1 := NewStore()
+	s1.InboxPath = path
+	if _, _, err := s1.SendMessage(context.Background(), a2a.MessageSendParams{
+		Message: a2a.Message{
+			MessageID: "keep1", Role: a2a.RoleUser,
+			Parts:    []a2a.Part{{Text: "survive me"}},
+			Metadata: map[string]any{"from": "peer-a"},
+		},
+	}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	// Simulate a bounce: a brand-new store pointed at the same snapshot.
+	s2 := NewStore()
+	s2.InboxPath = path
+	s2.LoadInbox()
+
+	pending := s2.PeekInbox()
+	if len(pending) != 1 {
+		t.Fatalf("restored inbox size = %d, want 1", len(pending))
+	}
+	if pending[0].MessageID != "keep1" {
+		t.Errorf("restored messageId = %q, want keep1", pending[0].MessageID)
+	}
+	if len(pending[0].Parts) == 0 || pending[0].Parts[0].Text != "survive me" {
+		t.Errorf("restored text = %+v, want 'survive me'", pending[0].Parts)
+	}
+	if from, _ := pending[0].Metadata["from"].(string); from != "peer-a" {
+		t.Errorf("restored from = %q, want peer-a", from)
+	}
+
+	// Drain, then a fresh reload of the now-empty snapshot must be a no-op.
+	if drained := s2.DrainInbox(); len(drained) != 1 {
+		t.Fatalf("drain = %d, want 1", len(drained))
+	}
+	s3 := NewStore()
+	s3.InboxPath = path
+	s3.LoadInbox()
+	if got := len(s3.PeekInbox()); got != 0 {
+		t.Fatalf("reload after drain = %d, want 0", got)
+	}
+}
+
+// TestInboxSoftCap verifies the inbox is bounded: past inboxSoftCap the oldest
+// entries are dropped (a stuck/never-drained bridge can't grow without bound).
+func TestInboxSoftCap(t *testing.T) {
+	s := NewStore()
+	total := inboxSoftCap + 25
+	for i := 0; i < total; i++ {
+		if _, _, err := s.SendMessage(context.Background(), a2a.MessageSendParams{
+			Message: a2a.Message{MessageID: fmt.Sprintf("m%05d", i), Role: a2a.RoleUser, Parts: []a2a.Part{{Text: "x"}}},
+		}); err != nil {
+			t.Fatalf("send %d: %v", i, err)
+		}
+	}
+	pending := s.PeekInbox()
+	if len(pending) != inboxSoftCap {
+		t.Fatalf("inbox size = %d, want soft cap %d", len(pending), inboxSoftCap)
+	}
+	// Oldest dropped → first survivor is index (total-cap).
+	want := fmt.Sprintf("m%05d", total-inboxSoftCap)
+	if pending[0].MessageID != want {
+		t.Errorf("oldest survivor = %q, want %q", pending[0].MessageID, want)
+	}
+}
+
+// TestCompleteTaskClearsOutgoingReplyNotification: a synthetic outgoing-reply
+// (its TaskID is an outgoing task, absent from s.tasks) is cleared by
+// CompleteTask rather than returning ErrTaskNotFound, so it does not keep the
+// inbox snapshot non-empty. A second delivery of the same task is a no-op.
+func TestCompleteTaskClearsOutgoingReplyNotification(t *testing.T) {
+	s := NewStore()
+	defer s.Close()
+	s.InboxPath = filepath.Join(t.TempDir(), "inbox.json")
+	// PeekInbox now consumes one-shot outgoing-replies (the wake-spam fix), so this
+	// test reads s.inbox directly to verify the CompleteTask clear-path without the
+	// peek-consume side effect.
+	inboxLen := func() int { s.mu.Lock(); defer s.mu.Unlock(); return len(s.inbox) }
+
+	// peer completes an outgoing task; the SSE fast-path renders the reply.
+	// Reply text must be non-empty: empty completions are suppressed (no inbox
+	// entry) by appendSyntheticReply, so a contentful reply is what exercises
+	// the CompleteTask clear-path this test covers.
+	s.TrackOutgoing("out-1", "http://peer/", "peer-A", "What is 2+2?")
+	if !s.IngestOutgoingTerminal(&a2a.Task{
+		ID: "out-1",
+		Status: a2a.TaskStatus{
+			State:   a2a.TaskStateCompleted,
+			Message: &a2a.Message{Parts: []a2a.Part{{Text: "4"}}},
+		},
+	}) {
+		t.Fatal("IngestOutgoingTerminal should deliver the tracked reply")
+	}
+
+	// reply is in the inbox and the persisted snapshot.
+	if got := inboxLen(); got != 1 {
+		t.Fatalf("inbox len after reply = %d, want 1", got)
+	}
+	before, err := os.ReadFile(s.InboxPath)
+	if err != nil {
+		t.Fatalf("read inbox file: %v", err)
+	}
+	if !strings.Contains(string(before), "out-1") {
+		t.Fatalf("inbox file should contain the outgoing-reply taskId; got %s", before)
+	}
+
+	// ack clears it (was ErrTaskNotFound).
+	if err := s.CompleteTask("out-1", ""); err != nil {
+		t.Fatalf("CompleteTask(outgoing-reply id) = %v, want nil", err)
+	}
+	if got := inboxLen(); got != 0 {
+		t.Fatalf("inbox len after ack = %d, want 0 (reply not cleared)", got)
+	}
+	after, err := os.ReadFile(s.InboxPath)
+	if err != nil {
+		t.Fatalf("read inbox file: %v", err)
+	}
+	if strings.Contains(string(after), "out-1") {
+		t.Fatalf("inbox file still retains the outgoing-reply after ack: %s", after)
+	}
+
+	// second delivery is a no-op: pendingOutgoing was deleted on first delivery.
+	if s.IngestOutgoingTerminal(&a2a.Task{
+		ID:     "out-1",
+		Status: a2a.TaskStatus{State: a2a.TaskStateCompleted},
+	}) {
+		t.Fatal("second IngestOutgoingTerminal should be a no-op (already delivered)")
+	}
+	if got := inboxLen(); got != 0 {
+		t.Fatalf("inbox len after second ingest = %d, want 0 (reply re-appended)", got)
+	}
+
+	// unknown id with no inbox entry still reports not-found.
+	if err := s.CompleteTask("never-seen", ""); !errors.Is(err, a2a.ErrTaskNotFound) {
+		t.Fatalf("CompleteTask(unknown id) = %v, want ErrTaskNotFound", err)
+	}
+}
+
+// TestIngestOutgoingTerminalSkipsEmptyReply verifies the empty-arrivals fix:
+// a peer completing our outbound task with NO reply text must not land an
+// empty "[ОТВЕТ …]" record in our inbox.
+func TestIngestOutgoingTerminalSkipsEmptyReply(t *testing.T) {
+	s := NewStore()
+	s.TrackOutgoing("task-empty", "http://peer/", "peer-A", "ping?")
+	ok := s.IngestOutgoingTerminal(&a2a.Task{
+		ID:     "task-empty",
+		Status: a2a.TaskStatus{State: a2a.TaskStateCompleted},
+		// no artifacts, no status message → empty reply text
+	})
+	if !ok {
+		t.Fatalf("IngestOutgoingTerminal = false, want true (tracked + terminal)")
+	}
+	if pending := s.PeekInbox(); len(pending) != 0 {
+		t.Fatalf("inbox size = %d, want 0 (empty reply must be suppressed)", len(pending))
+	}
+}
+
+// TestEvictTerminalReapsDeliveredOutgoingReplies verifies the stale-re-render
+// fix: aged one-shot outgoing-reply records are evicted by identity, while a
+// fresh reply and genuine incoming messages survive.
+func TestEvictTerminalReapsDeliveredOutgoingReplies(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+	oldTS := now.Add(-20 * time.Minute).UTC().Format(time.RFC3339)
+	freshTS := now.UTC().Format(time.RFC3339)
+	s.mu.Lock()
+	s.inbox = []a2a.Message{
+		{MessageID: "reply-old", TaskID: "old", Metadata: map[string]any{"kind": "outgoing-reply", "ts": oldTS}},
+		{MessageID: "reply-fresh", TaskID: "fresh", Metadata: map[string]any{"kind": "outgoing-reply", "ts": freshTS}},
+		{MessageID: "incoming-1", TaskID: "inc"}, // genuine incoming, no ts → never evicted
+	}
+	s.mu.Unlock()
+
+	s.evictTerminal(now)
+
+	got := s.PeekInbox()
+	if len(got) != 2 {
+		t.Fatalf("inbox size after evict = %d, want 2 (aged reply reaped)", len(got))
+	}
+	for _, m := range got {
+		if m.MessageID == "reply-old" {
+			t.Fatal("reply-old should have been evicted")
+		}
+	}
+}
+
+// TestPeekConsumesOutgoingReply verifies the wake-spam fix: PEEK returns an
+// outgoing-reply once then consumes it (so it stops re-surfacing every wake),
+// while genuine incoming task messages survive peek (stays non-destructive).
+func TestPeekConsumesOutgoingReply(t *testing.T) {
+	s := NewStore()
+	defer s.Close()
+	s.InboxPath = filepath.Join(t.TempDir(), "inbox.json")
+	s.mu.Lock()
+	s.inbox = []a2a.Message{
+		{MessageID: "incoming-1", TaskID: "t1", Parts: []a2a.Part{{Text: "hi"}}},
+		{MessageID: "reply-out1", TaskID: "out1", Parts: []a2a.Part{{Text: "done"}},
+			Metadata: map[string]any{"kind": "outgoing-reply"}},
+	}
+	s.mu.Unlock()
+
+	if first := s.PeekInbox(); len(first) != 2 {
+		t.Fatalf("first peek len=%d, want 2 (returns both once)", len(first))
+	}
+	second := s.PeekInbox()
+	if len(second) != 1 || second[0].MessageID != "incoming-1" {
+		t.Fatalf("second peek = %d msgs, want only incoming-1 (reply consumed)", len(second))
+	}
+}
+
+// TestLoadInboxKeepsReplyTimestamp: a one-shot outgoing-reply restored from the
+// snapshot must still age out; without its delivery timestamp a bridge restart
+// would resurrect it on every wake.
+func TestLoadInboxKeepsReplyTimestamp(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "inbox.json")
+	delivered := time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339)
+
+	s := NewStore()
+	s.InboxPath = path
+	s.mu.Lock()
+	s.appendInboxLocked(a2a.Message{
+		MessageID: "reply-task-1", TaskID: "task-1", Role: a2a.RoleAgent,
+		Parts:    []a2a.Part{{Text: "done"}},
+		Metadata: map[string]any{"from": "peer", "kind": "outgoing-reply", "ts": delivered},
+	})
+	s.appendInboxLocked(a2a.Message{
+		MessageID: "incoming-1", TaskID: "task-2", Role: a2a.RoleUser,
+		Parts: []a2a.Part{{Text: "hello"}},
+	})
+	s.persistInboxLocked()
+	s.mu.Unlock()
+	s.Close()
+
+	restored := NewStore()
+	defer restored.Close()
+	restored.InboxPath = path
+	restored.LoadInbox()
+	restored.evictTerminal(time.Now())
+
+	restored.mu.Lock()
+	defer restored.mu.Unlock()
+	if len(restored.inbox) != 1 || restored.inbox[0].MessageID != "incoming-1" {
+		t.Fatalf("inbox after restart and eviction = %+v, want only incoming-1", restored.inbox)
 	}
 }
