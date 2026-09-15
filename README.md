@@ -644,6 +644,8 @@ Conventional Commits, English subjects, no AI co-authors.
 - Push notifications: every task event is delivered to registered webhooks with `A2A-Notification-Token`, bounded retries and an SSRF guard
 - mTLS server/client auth with ed25519 cert generation
 
+Measured against the official A2A TCK and the official Python SDK: [docs/conformance.md](docs/conformance.md).
+
 **Upgrading from 3.x:** 4.0 bridges speak only the A2A 1.0 wire format. The `/v1/` REST routes, the pre-1.0 method names (`message/send`, `a2a.SendMessage`, ...) and the `/.well-known/a2a` card path are gone; upgrade every bridge on the mesh together. `a2abridge update` and `install.sh` install the latest release, so they move a 3.x bridge to 4.0; on a mesh that cannot upgrade at once, stay on 3.x with `a2abridge update --version v3.1.0` or `A2A_VERSION=v3.1.0` for `install.sh`.
 
 Not yet implemented: gRPC binding.
