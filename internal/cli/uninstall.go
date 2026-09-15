@@ -11,7 +11,7 @@ import (
 
 	"github.com/kardianos/service"
 
-	"github.com/vbcherepanov/a2abridge/internal/ideconfig"
+	"github.com/vbcherepanov/a2abridge/v4/internal/ideconfig"
 )
 
 func init() {

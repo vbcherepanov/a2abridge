@@ -3,155 +3,57 @@ package agent
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
-	"github.com/google/uuid"
-	"github.com/vbcherepanov/a2abridge/internal/a2a"
-	"github.com/vbcherepanov/a2abridge/internal/metrics"
+	"github.com/a2aproject/a2a-go/v2/a2a"
+	"github.com/a2aproject/a2a-go/v2/a2asrv/push"
+
+	"github.com/vbcherepanov/a2abridge/v4/internal/metrics"
 )
 
-// PushStore implements a2a.PushHandler. Per A2A 1.0 §9.5, peers register
-// webhook URLs so they receive task state updates without keeping an SSE
-// stream open. We persist configs in-memory only — bridges are short-lived
-// (they die with the IDE session), so survival across restarts isn't worth
-// the complexity. Configs are scoped per task id.
-type PushStore struct {
-	mu      sync.Mutex
-	configs map[string]map[string]a2a.PushNotificationConfig // taskID -> configID -> config
-}
+// Push delivery knobs. Worst case per event is sum(delays) +
+// pushMaxAttempts*pushAttemptTimeout = 200+400+800+1600 ms + 5*5 s = 28 s.
+// Webhooks are a fan-out side effect, not a guaranteed-delivery channel.
+const (
+	pushMaxAttempts       = 5
+	pushBaseDelay         = 200 * time.Millisecond
+	pushMaxDelay          = 3200 * time.Millisecond
+	pushAttemptTimeout    = 5 * time.Second
+	pushMaxRedirects      = 10
+	pushDialTimeout       = 30 * time.Second
+	pushDialKeepAlive     = 30 * time.Second
+	pushIdleConnTimeout   = 90 * time.Second
+	pushTLSHandshake      = 10 * time.Second
+	pushExpectContinue    = time.Second
+	pushMaxIdleConns      = 100
+	pushResponseDrainSize = 64 << 10
+	pushTokenHeader       = "A2A-Notification-Token"
 
-// NewPushStore — fresh empty registry.
-func NewPushStore() *PushStore {
-	return &PushStore{configs: map[string]map[string]a2a.PushNotificationConfig{}}
-}
+	// pushQueueSize bounds the events waiting for one push config; events
+	// for a webhook that falls this far behind are dropped.
+	pushQueueSize = 64
 
-// CreatePushConfig registers a new webhook for the named task.
-func (p *PushStore) CreatePushConfig(_ context.Context, in a2a.TaskPushNotificationConfig) (*a2a.TaskPushNotificationConfig, error) {
-	if in.TaskID == "" {
-		return nil, errors.New("taskId required")
-	}
-	if in.Config.URL == "" {
-		return nil, errors.New("pushNotificationConfig.url required")
-	}
-	cfg := in.Config
-	if cfg.ID == "" {
-		cfg.ID = uuid.NewString()
-	}
-	p.mu.Lock()
-	if p.configs[in.TaskID] == nil {
-		p.configs[in.TaskID] = map[string]a2a.PushNotificationConfig{}
-	}
-	p.configs[in.TaskID][cfg.ID] = cfg
-	p.mu.Unlock()
-	return &a2a.TaskPushNotificationConfig{TaskID: in.TaskID, Config: cfg}, nil
-}
+	// pushWorkerIdleTimeout retires a config's worker when no event arrives.
+	pushWorkerIdleTimeout = 2 * time.Minute
+)
 
-// GetPushConfig returns one config by id; empty PushConfigID means "the
-// only one for this task" (errors if multiple are registered).
-func (p *PushStore) GetPushConfig(_ context.Context, in a2a.PushNotificationConfigParams) (*a2a.TaskPushNotificationConfig, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	configs, ok := p.configs[in.TaskID]
-	if !ok || len(configs) == 0 {
-		return nil, a2a.ErrTaskNotFound
-	}
-	if in.PushConfigID == "" {
-		if len(configs) != 1 {
-			return nil, errors.New("pushNotificationConfigId required when multiple configs are registered")
-		}
-		for _, cfg := range configs {
-			return &a2a.TaskPushNotificationConfig{TaskID: in.TaskID, Config: cfg}, nil
-		}
-	}
-	cfg, ok := configs[in.PushConfigID]
-	if !ok {
-		return nil, a2a.ErrTaskNotFound
-	}
-	return &a2a.TaskPushNotificationConfig{TaskID: in.TaskID, Config: cfg}, nil
-}
+// errBlockedPushTarget is returned when a webhook URL resolves to a
+// non-public address range (SSRF protection, CWE-918).
+var errBlockedPushTarget = errors.New("push notification target resolves to a blocked address range")
 
-// ListPushConfigs returns every config registered for the task. Empty
-// taskID returns the flat list of every registered config across tasks
-// (useful for diagnostics).
-func (p *PushStore) ListPushConfigs(_ context.Context, taskID string) ([]a2a.TaskPushNotificationConfig, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	out := []a2a.TaskPushNotificationConfig{}
-	if taskID == "" {
-		for tid, configs := range p.configs {
-			for _, cfg := range configs {
-				out = append(out, a2a.TaskPushNotificationConfig{TaskID: tid, Config: cfg})
-			}
-		}
-		return out, nil
-	}
-	for _, cfg := range p.configs[taskID] {
-		out = append(out, a2a.TaskPushNotificationConfig{TaskID: taskID, Config: cfg})
-	}
-	return out, nil
-}
-
-// DeletePushConfig removes a registered webhook. Empty PushConfigID
-// removes ALL webhooks for the task — matches the spec's "delete all" intent.
-func (p *PushStore) DeletePushConfig(_ context.Context, in a2a.PushNotificationConfigParams) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if _, ok := p.configs[in.TaskID]; !ok {
-		return a2a.ErrTaskNotFound
-	}
-	if in.PushConfigID == "" {
-		delete(p.configs, in.TaskID)
-		return nil
-	}
-	delete(p.configs[in.TaskID], in.PushConfigID)
-	if len(p.configs[in.TaskID]) == 0 {
-		delete(p.configs, in.TaskID)
-	}
-	return nil
-}
-
-// Notify is called by the bridge whenever a task state changes. It POSTs
-// the event body to every webhook registered for that task. Failures are
-// best-effort — a 500 from a peer's webhook does not affect the task.
-//
-// The body shape mirrors what we'd send over SSE: `{ "event": <event-type>,
-// "data": <event-payload> }` so subscribers can write a single dispatcher
-// regardless of transport.
-func (p *PushStore) Notify(taskID string, ev a2a.StreamResponse) {
-	p.mu.Lock()
-	configs := p.configs[taskID]
-	if len(configs) == 0 {
-		p.mu.Unlock()
-		return
-	}
-	// Snapshot to avoid holding the lock during HTTP I/O.
-	snapshot := make([]a2a.PushNotificationConfig, 0, len(configs))
-	for _, cfg := range configs {
-		snapshot = append(snapshot, cfg)
-	}
-	p.mu.Unlock()
-
-	payload, err := json.Marshal(ev)
-	if err != nil {
-		return
-	}
-
-	for _, cfg := range snapshot {
-		go deliverWebhook(cfg, payload)
-	}
-}
-
-// retryPolicy defines the per-attempt behaviour for webhook delivery.
-// Total worst-case time is sum(delays) + maxAttempts * perAttemptTimeout
-// = 200+400+800+1600+3200 ms + 5*5s = 31.2s before giving up.
-//
-// We deliberately keep this short — webhooks are a fan-out side effect,
-// not a guaranteed-delivery channel.
+// retryPolicy is the per-sender delivery policy; tests shrink the delays.
 type retryPolicy struct {
 	maxAttempts int
 	baseDelay   time.Duration
@@ -160,93 +62,353 @@ type retryPolicy struct {
 }
 
 var defaultRetryPolicy = retryPolicy{
-	maxAttempts: 5,
-	baseDelay:   200 * time.Millisecond,
-	maxDelay:    3200 * time.Millisecond,
-	perAttempt:  5 * time.Second,
+	maxAttempts: pushMaxAttempts,
+	baseDelay:   pushBaseDelay,
+	maxDelay:    pushMaxDelay,
+	perAttempt:  pushAttemptTimeout,
 }
 
-// deliverWebhook posts the event body with exponential backoff retry.
-// Retried statuses: any 5xx, plus network errors / timeouts. 4xx is
-// treated as a permanent client mistake and not retried — re-sending the
-// same payload that caused 400 won't make it 200.
-func deliverWebhook(cfg a2a.PushNotificationConfig, body []byte) {
-	deliverWebhookWithPolicy(cfg, body, defaultRetryPolicy)
+// pushJob is one serialized event waiting for delivery.
+type pushJob struct {
+	config   a2a.PushConfig
+	body     []byte
+	terminal bool
 }
 
-// deliverWebhookWithPolicy is the explicit-policy variant used by tests
-// to dial down delays without touching globals.
-func deliverWebhookWithPolicy(cfg a2a.PushNotificationConfig, body []byte, policy retryPolicy) {
-	delay := policy.baseDelay
-	for attempt := 1; attempt <= policy.maxAttempts; attempt++ {
-		ok, retryable := postOnce(cfg, body, policy.perAttempt)
-		if ok {
-			metrics.IncPushDelivered()
-			return
-		}
-		if !retryable {
-			metrics.IncPushFailed()
-			return // permanent failure (4xx, malformed URL, etc.)
-		}
-		if attempt == policy.maxAttempts {
-			metrics.IncPushFailed()
-			return
-		}
-		time.Sleep(delay)
-		delay *= 2
-		if delay > policy.maxDelay {
-			delay = policy.maxDelay
-		}
+// pushWorkerKey identifies one webhook registration.
+type pushWorkerKey struct {
+	taskID   a2a.TaskID
+	configID string
+}
+
+type pushWorker struct {
+	queue chan pushJob
+}
+
+// PushSender delivers task events to webhooks registered per A2A 1.0 push
+// notifications. SendPush only enqueues, so a slow or dead webhook never
+// stalls task event processing: every push config gets one worker that
+// delivers its events in order, retrying network errors and 5xx with backoff,
+// never 4xx. Delivery failures are logged and counted but never fail the task.
+type PushSender struct {
+	client *http.Client
+	policy retryPolicy
+	log    *slog.Logger
+
+	queueSize   int
+	idleTimeout time.Duration
+
+	// ctx bounds every delivery; Close cancels it once draining ends.
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	mu      sync.Mutex
+	closed  bool
+	workers map[pushWorkerKey]*pushWorker
+	wg      sync.WaitGroup
+}
+
+var _ push.Sender = (*PushSender)(nil)
+
+// NewPushSender builds a sender whose HTTP client presents tlsConfig
+// (federation mTLS; nil for plain loopback). Unless allowPrivateNetworks is
+// set, every dial — including redirect hops — is refused when the resolved
+// address is loopback, private, link-local, multicast or unspecified.
+// Callers must Close the sender to drain pending deliveries.
+func NewPushSender(tlsConfig *tls.Config, allowPrivateNetworks bool, log *slog.Logger) *PushSender {
+	dialer := &net.Dialer{Timeout: pushDialTimeout, KeepAlive: pushDialKeepAlive}
+	if !allowPrivateNetworks {
+		dialer.Control = guardPushDial
+	}
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           dialer.DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          pushMaxIdleConns,
+		IdleConnTimeout:       pushIdleConnTimeout,
+		TLSHandshakeTimeout:   pushTLSHandshake,
+		ExpectContinueTimeout: pushExpectContinue,
+	}
+	if tlsConfig != nil {
+		transport.TLSClientConfig = tlsConfig.Clone()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &PushSender{
+		client:      &http.Client{Transport: transport, CheckRedirect: limitPushRedirects},
+		policy:      defaultRetryPolicy,
+		log:         log,
+		queueSize:   pushQueueSize,
+		idleTimeout: pushWorkerIdleTimeout,
+		ctx:         ctx,
+		cancel:      cancel,
+		workers:     map[pushWorkerKey]*pushWorker{},
 	}
 }
 
-// postOnce returns (delivered, retryable). delivered=true means the peer
-// accepted the webhook (2xx); retryable=true means we should try again
-// on a network/5xx failure.
-func postOnce(cfg a2a.PushNotificationConfig, body []byte, perAttempt time.Duration) (bool, bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), perAttempt)
+// SendPush implements push.Sender. It queues the event for the config's
+// worker and returns at once. a2a-go fails the task when a sender returns an
+// error, so problems are logged and counted and nil is always returned.
+func (s *PushSender) SendPush(_ context.Context, config *a2a.PushConfig, event a2a.Event) error {
+	if config == nil {
+		s.log.Warn("push skipped: nil config")
+		return nil
+	}
+	body, err := json.Marshal(a2a.StreamResponse{Event: event})
+	if err != nil {
+		metrics.IncPushFailed()
+		s.log.Warn("push event encode failed", "task", config.TaskID, "err", err)
+		return nil
+	}
+	job := pushJob{config: copyPushConfig(config), body: body, terminal: isTerminalEvent(event)}
+	key := pushWorkerKey{taskID: config.TaskID, configID: config.ID}
+
+	// Enqueue under the lock: a worker retires only with the lock held and
+	// an empty queue, so a queued job is never left without a worker.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		metrics.IncPushFailed()
+		s.log.Warn("push dropped: sender closed", "task", config.TaskID, "config", config.ID)
+		return nil
+	}
+	w, ok := s.workers[key]
+	if !ok {
+		w = &pushWorker{queue: make(chan pushJob, s.queueSize)}
+		s.workers[key] = w
+		s.wg.Add(1)
+		go s.run(key, w)
+	}
+	select {
+	case w.queue <- job:
+	default:
+		metrics.IncPushFailed()
+		s.log.Warn("push dropped: delivery queue full", "task", config.TaskID, "config", config.ID, "queue", s.queueSize)
+	}
+	return nil
+}
+
+// Close stops accepting events and lets every worker deliver what is already
+// queued. It returns once the workers are done or ctx is done; in the latter
+// case in-flight and remaining deliveries are aborted before it returns.
+// Safe to call multiple times.
+func (s *PushSender) Close(ctx context.Context) error {
+	s.mu.Lock()
+	if !s.closed {
+		s.closed = true
+		for _, w := range s.workers {
+			close(w.queue)
+		}
+	}
+	s.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		s.cancel()
+		return nil
+	case <-ctx.Done():
+		s.cancel()
+		<-done
+		return fmt.Errorf("push sender drain: %w", ctx.Err())
+	}
+}
+
+// run delivers one config's events in order until the config's task reached
+// a terminal state, the worker stayed idle for idleTimeout, or Close.
+func (s *PushSender) run(key pushWorkerKey, w *pushWorker) {
+	defer s.wg.Done()
+	idle := time.NewTimer(s.idleTimeout)
+	defer idle.Stop()
+	for {
+		select {
+		case job, ok := <-w.queue:
+			if !ok {
+				// Closed by Close and fully drained: unregister and exit.
+				s.retire(key, w)
+				return
+			}
+			s.deliverJob(&job)
+			if job.terminal && s.retire(key, w) {
+				return
+			}
+		case <-idle.C:
+			if s.retire(key, w) {
+				return
+			}
+		}
+		idle.Reset(s.idleTimeout)
+	}
+}
+
+// retire unregisters the worker when nothing is queued for it.
+func (s *PushSender) retire(key pushWorkerKey, w *pushWorker) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(w.queue) > 0 {
+		return false
+	}
+	if s.workers[key] == w {
+		delete(s.workers, key)
+	}
+	return true
+}
+
+// activeWorkers reports how many push configs currently have a worker.
+func (s *PushSender) activeWorkers() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.workers)
+}
+
+func (s *PushSender) deliverJob(job *pushJob) {
+	err := s.deliver(s.ctx, &job.config, job.body)
+	if err == nil {
+		metrics.IncPushDelivered()
+		return
+	}
+	metrics.IncPushFailed()
+	if s.ctx.Err() != nil {
+		s.log.Debug("push delivery aborted by shutdown", "task", job.config.TaskID, "config", job.config.ID)
+		return
+	}
+	s.log.Warn("push delivery failed", "task", job.config.TaskID, "config", job.config.ID, "host", webhookHost(job.config.URL), "err", err)
+}
+
+// deliver posts body until it is accepted, a permanent failure occurs, the
+// attempts run out or ctx is done.
+func (s *PushSender) deliver(ctx context.Context, config *a2a.PushConfig, body []byte) error {
+	delay := s.policy.baseDelay
+	for attempt := 1; ; attempt++ {
+		retryable, err := s.postOnce(ctx, config, body)
+		if err == nil {
+			return nil
+		}
+		if !retryable || attempt >= s.policy.maxAttempts {
+			return fmt.Errorf("attempt %d: %w", attempt, err)
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("attempt %d: %w (retry aborted: %w)", attempt, err, ctx.Err())
+		case <-timer.C:
+		}
+		delay = min(delay*2, s.policy.maxDelay)
+	}
+}
+
+// postOnce performs one POST. retryable reports whether a failure is worth
+// another attempt: network errors and 5xx are, 4xx and blocked targets are not.
+func (s *PushSender) postOnce(ctx context.Context, config *a2a.PushConfig, body []byte) (retryable bool, err error) {
+	actx, cancel := context.WithTimeout(ctx, s.policy.perAttempt)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.URL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(actx, http.MethodPost, config.URL, bytes.NewReader(body))
 	if err != nil {
-		return false, false // malformed URL: not retryable
+		return false, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("A2A-Version", a2a.ProtocolVersion)
-	if cfg.Token != "" {
-		req.Header.Set("X-A2A-Token", cfg.Token)
+	if config.Token != "" {
+		req.Header.Set(pushTokenHeader, config.Token)
 	}
-	if cfg.Authentication != nil && cfg.Authentication.Credentials != "" {
-		// Spec doesn't pin the header name; "Authorization" is the
-		// pragmatic default. Schemes like Basic / Bearer are typically
-		// embedded in the credentials string itself.
-		req.Header.Set("Authorization", fmt.Sprintf("%s %s",
-			firstScheme(cfg.Authentication.Schemes), cfg.Authentication.Credentials))
+	if config.Auth != nil && config.Auth.Credentials != "" {
+		switch strings.ToLower(config.Auth.Scheme) {
+		case "bearer":
+			req.Header.Set("Authorization", "Bearer "+config.Auth.Credentials)
+		case "basic":
+			req.Header.Set("Authorization", "Basic "+config.Auth.Credentials)
+		default:
+			s.log.Warn("push auth scheme unsupported, sending without Authorization", "scheme", config.Auth.Scheme, "task", config.TaskID)
+		}
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := s.client.Do(req)
 	if err != nil {
-		// Network error / timeout — retry.
-		return false, true
+		if errors.Is(err, errBlockedPushTarget) {
+			return false, err
+		}
+		return ctx.Err() == nil, err
 	}
-	resp.Body.Close()
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			s.log.Debug("push response close failed", "err", cerr)
+		}
+	}()
+	if _, derr := io.Copy(io.Discard, io.LimitReader(resp.Body, pushResponseDrainSize)); derr != nil {
+		s.log.Debug("push response drain failed", "err", derr)
+	}
 
-	if resp.StatusCode/100 == 2 {
-		return true, false
+	switch {
+	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		return false, nil
+	case resp.StatusCode >= 500:
+		return true, fmt.Errorf("webhook returned %s", resp.Status)
+	default:
+		return false, fmt.Errorf("webhook returned %s", resp.Status)
 	}
-	if resp.StatusCode >= 500 {
-		return false, true
-	}
-	// 3xx redirects: stdlib already followed; if we landed here, it's
-	// likely a 4xx. 4xx = permanent.
-	return false, false
 }
 
-// firstScheme returns the first auth scheme name for the Authorization
-// header, defaulting to "Bearer" when the schemes list is empty.
-func firstScheme(schemes []string) string {
-	if len(schemes) == 0 {
-		return "Bearer"
+// copyPushConfig detaches a config from the caller's pointers; the event
+// loop may reuse them while the worker still holds the job.
+func copyPushConfig(c *a2a.PushConfig) a2a.PushConfig {
+	cp := *c
+	if c.Auth != nil {
+		auth := *c.Auth
+		cp.Auth = &auth
 	}
-	return schemes[0]
+	return cp
+}
+
+// guardPushDial runs after DNS resolution, so it also covers DNS rebinding
+// and every redirect hop, which a URL-string check alone cannot catch.
+func guardPushDial(_, address string, _ syscall.RawConn) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("invalid dial address %q: %w", address, err)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return fmt.Errorf("%w: unresolved host %q", errBlockedPushTarget, host)
+	}
+	if isBlockedIP(ip) {
+		return fmt.Errorf("%w: %s", errBlockedPushTarget, ip)
+	}
+	return nil
+}
+
+// isBlockedIP reports whether ip is in a range a webhook must not reach,
+// covering cloud metadata endpoints and internal services.
+func isBlockedIP(ip net.IP) bool {
+	return ip.IsLoopback() ||
+		ip.IsPrivate() ||
+		ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() ||
+		ip.IsUnspecified() ||
+		ip.IsMulticast()
+}
+
+// limitPushRedirects bounds the redirect chain and drops the notification
+// token on cross-host hops: Go strips Authorization there but not custom headers.
+func limitPushRedirects(req *http.Request, via []*http.Request) error {
+	if len(via) >= pushMaxRedirects {
+		return fmt.Errorf("stopped after %d redirects", pushMaxRedirects)
+	}
+	if len(via) > 0 && req.URL.Host != via[len(via)-1].URL.Host {
+		req.Header.Del(pushTokenHeader)
+	}
+	return nil
+}
+
+// webhookHost returns the host of a webhook URL for logs; the full URL may
+// carry credentials in its query.
+func webhookHost(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return u.Host
 }

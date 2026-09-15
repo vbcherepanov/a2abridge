@@ -10,8 +10,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/vbcherepanov/a2abridge/internal/a2a"
 )
 
 // DetectNudgeMode picks the best cross-platform backend available.
@@ -62,7 +60,7 @@ func NewDtachNudger(socket string, log *slog.Logger) *Nudger {
 // Handle is meant to be attached to Store.OnIncoming.
 // It types a short directive into the parent terminal which triggers the
 // live agent (Claude/Codex) to process its inbox on the very next turn.
-func (n *Nudger) Handle(_ a2a.Message) {
+func (n *Nudger) Handle(_ *InboxEntry) {
 	if n.Mode == "" {
 		return
 	}

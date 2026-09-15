@@ -13,7 +13,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/vbcherepanov/a2abridge/internal/directory"
+	"github.com/vbcherepanov/a2abridge/v4/internal/directory"
 )
 
 // RunDirectory runs the local A2A discovery service.

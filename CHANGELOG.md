@@ -4,7 +4,55 @@ All notable changes to a2abridge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [4.0.0] — 2026-09-15
+
+### Changed (breaking)
+
+- **Module path is now `github.com/vbcherepanov/a2abridge/v4`**, as Go
+  requires for major version 2 and above. Install with
+  `go install github.com/vbcherepanov/a2abridge/v4/cmd/a2abridge@latest`;
+  the old path resolves only to v1.1.0 on the Go module proxy.
+- **A2A 1.0 wire format through the official Go SDK.** The hand-written
+  protocol layer is replaced by [a2a-go](https://github.com/a2aproject/a2a-go)
+  v2.5.0. Bridges serve the JSON-RPC binding at `POST /` with the 1.0 method
+  names (`SendMessage`, `SendStreamingMessage`, `GetTask`, `ListTasks`,
+  `CancelTask`, `SubscribeToTask`, `CreateTaskPushNotificationConfig`,
+  `GetTaskPushNotificationConfig`, `ListTaskPushNotificationConfigs`,
+  `DeleteTaskPushNotificationConfig`, `GetExtendedAgentCard`) and the
+  HTTP+JSON binding (`POST /message:send`, `GET /tasks/{id}`, ...). The Agent
+  Card lists both in `supportedInterfaces`. Enum values, the Part union and
+  error codes follow the 1.0 schema, so 3.x and 4.0 bridges cannot talk to
+  each other: upgrade every bridge on the mesh together.
+  `a2abridge update` and `install.sh` pick the latest release and cross this
+  major version; pin `--version v3.1.0` (or `A2A_VERSION=v3.1.0`) to stay on 3.x.
+- **Removed** the non-spec REST API under `/v1/`, the legacy method names
+  (`message/send`, `tasks/get`, `a2a.SendMessage`, ...) and the legacy card
+  path `/.well-known/a2a`.
+- **One message per task.** A task stays `working` until the host answers
+  with `a2a_complete_task`, and a message to a task that is still being worked
+  on (or already finished) is rejected. Continue a conversation by sending a
+  new message with the same `context_id`; `task_id` is only for a task
+  awaiting input. A redelivered `messageId` is still queued once; the
+  redelivery's own task ends `rejected`.
+- **MCP inbox entries.** `a2a_inbox` returns flat objects
+  `{messageId, taskId, contextId, from, text, kind?, state?, ts?}` instead of
+  A2A `Message` objects. The on-disk `inbox.json` snapshot format is unchanged.
+- **Push notifications** POST an A2A 1.0 `StreamResponse` with the
+  `A2A-Notification-Token` header (was `X-A2A-Token`). With federation TLS
+  enabled, webhook URLs resolving to loopback, private or link-local
+  addresses are refused unless `A2A_PUSH_ALLOW_PRIVATE=1`.
+- **`A2A-Version` is required.** A request whose `A2A-Version` header (or
+  request parameter) is not 1.0 in Major.Minor gets
+  `VersionNotSupportedError` (`-32009` / HTTP 400). A request without it is
+  read as 0.3, as the spec prescribes, and rejected the same way. The a2a-go
+  and a2a-sdk clients send the header on every request.
+- `SubscribeToTask` on an unknown task answers `TaskNotFoundError` and on a
+  finished task `UnsupportedOperationError`, as a plain error instead of an
+  SSE stream carrying the error.
+- Task status timestamps are serialized in UTC (`...Z`).
+- **Request limits.** A2A request bodies are capped at 10 MiB (`413` /
+  JSON-RPC `-32600` beyond that) and reading a request is bounded by a
+  one-minute timeout; SSE responses are not affected.
 
 ### Added
 
@@ -12,6 +60,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `~/.gemini/config/mcp_config.json` or `~/.gemini/antigravity-cli` and
   writes the MCP block to `mcp_config.json`; `uninstall` and `doctor` cover
   it too (`--ide antigravity`) (#19).
+- `cmd/a2abridge-tck` (build tag `tck`): the bridge's HTTP stack with an
+  executor for the official A2A TCK scenarios
+  (`go build -tags tck ./cmd/a2abridge-tck`).
+- The Agent Card is served with `Cache-Control: public, max-age=300`, a
+  strong `ETag` and `Last-Modified`; `If-None-Match` answers `304`.
 
 ## [3.1.0] — 2026-09-15
 

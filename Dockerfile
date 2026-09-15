@@ -20,9 +20,9 @@ COPY . .
 RUN --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=linux \
     go build -trimpath -ldflags="-s -w \
-      -X github.com/vbcherepanov/a2abridge/internal/buildinfo.Version=${VERSION} \
-      -X github.com/vbcherepanov/a2abridge/internal/buildinfo.Commit=${COMMIT} \
-      -X github.com/vbcherepanov/a2abridge/internal/buildinfo.BuildDate=${DATE}" \
+      -X github.com/vbcherepanov/a2abridge/v4/internal/buildinfo.Version=${VERSION} \
+      -X github.com/vbcherepanov/a2abridge/v4/internal/buildinfo.Commit=${COMMIT} \
+      -X github.com/vbcherepanov/a2abridge/v4/internal/buildinfo.BuildDate=${DATE}" \
     -o /a2abridge ./cmd/a2abridge
 
 # distroless/static is the smallest base that has /etc/ssl/certs (needed

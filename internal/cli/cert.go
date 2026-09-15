@@ -8,7 +8,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/vbcherepanov/a2abridge/internal/security"
+	"github.com/vbcherepanov/a2abridge/v4/internal/security"
 )
 
 func init() {

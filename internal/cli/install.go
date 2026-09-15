@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/vbcherepanov/a2abridge/internal/assets"
-	"github.com/vbcherepanov/a2abridge/internal/ideconfig"
+	"github.com/vbcherepanov/a2abridge/v4/internal/assets"
+	"github.com/vbcherepanov/a2abridge/v4/internal/ideconfig"
 )
 
 func init() {

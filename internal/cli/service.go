@@ -15,8 +15,8 @@ import (
 
 	"github.com/kardianos/service"
 
-	"github.com/vbcherepanov/a2abridge/internal/buildinfo"
-	"github.com/vbcherepanov/a2abridge/internal/security"
+	"github.com/vbcherepanov/a2abridge/v4/internal/buildinfo"
+	"github.com/vbcherepanov/a2abridge/v4/internal/security"
 )
 
 const (

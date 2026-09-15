@@ -4,21 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"log/slog"
-	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
+	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/mark3labs/mcp-go/server"
-
-	"github.com/vbcherepanov/a2abridge/internal/a2a"
 )
 
 const testSecret = "ghp_0123456789012345678901234567890123456789"
-
-func discardLog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
 // callTool drives a registered MCP tool through the real JSON-RPC
 // dispatcher so the test exercises the exact code path the IDE uses.
@@ -37,12 +30,16 @@ func callTool(t *testing.T, s *server.MCPServer, name string, args map[string]an
 	return string(b)
 }
 
-func newTestMCP(t *testing.T, store *Store) *server.MCPServer {
+func newTestMCP(t *testing.T, store *Store, executor *Executor) *server.MCPServer {
 	t.Helper()
 	mcpSrv := server.NewMCPServer("test", "0.0.0")
 	RegisterTools(mcpSrv, &MCPDeps{
+		Lifetime:     t.Context(),
 		Store:        store,
-		OwnCard:      a2a.AgentCard{Name: "self", URL: "http://self.invalid"},
+		Executor:     executor,
+		Peers:        NewPeers(nil, discardLog()),
+		OwnCard:      &a2a.AgentCard{Name: "self"},
+		SelfURL:      "http://self.invalid",
 		DirectoryURL: "http://127.0.0.1:1", // unused by the tools under test
 		Log:          discardLog(),
 	})
@@ -50,35 +47,27 @@ func newTestMCP(t *testing.T, store *Store) *server.MCPServer {
 }
 
 // TestCompleteTaskToolScreensSecrets — a2a_complete_task is an outbound
-// path (the reply leaves via SSE / webhooks), so it must run through the
+// path (the reply leaves via streams / webhooks), so it must run through the
 // same secret screen as a2a_send_message.
 func TestCompleteTaskToolScreensSecrets(t *testing.T) {
-	store := NewStore()
-	defer store.Close()
-	task, _, err := store.SendMessage(context.Background(), a2a.MessageSendParams{
-		Message: a2a.Message{Role: a2a.RoleUser, Parts: []a2a.Part{{Text: "what's the token?"}}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	a := newTestAgent(t, "self")
+	c := a.client(t)
+	task := sendImmediate(t, c, userMessage("what's the token?"))
+	waitTaskState(t, c, task.ID, a2a.TaskStateWorking)
 
-	mcpSrv := newTestMCP(t, store)
-	resp := callTool(t, mcpSrv, "a2a_complete_task", map[string]any{
-		"task_id": task.ID,
+	resp := callTool(t, newTestMCP(t, a.store, a.executor), "a2a_complete_task", map[string]any{
+		"task_id": string(task.ID),
 		"text":    "use " + testSecret + " for auth",
 	})
 	if strings.Contains(resp, testSecret) {
 		t.Error("tool result leaked the raw secret")
 	}
+	if !strings.Contains(resp, "completed") {
+		t.Fatalf("tool result = %s, want completed", resp)
+	}
 
-	got, err := store.GetTask(context.Background(), a2a.TaskIDParams{ID: task.ID})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got.Artifacts) == 0 || len(got.Artifacts[0].Parts) == 0 {
-		t.Fatal("no reply artifact recorded")
-	}
-	reply := got.Artifacts[0].Parts[0].Text
+	done := waitTaskState(t, c, task.ID, a2a.TaskStateCompleted)
+	reply := extractReplyText(done)
 	if strings.Contains(reply, testSecret) {
 		t.Error("raw secret reached the task artifact")
 	}
@@ -91,48 +80,85 @@ func TestCompleteTaskToolScreensSecrets(t *testing.T) {
 // side door for unredacted text: the peer's inbox must only ever see the
 // redacted form.
 func TestSendStreamingToolScreensSecrets(t *testing.T) {
-	peerStore := NewStore()
-	defer peerStore.Close()
+	peer := newTestAgent(t, "peer")
+	inbound := make(chan InboxEntry, 1)
 	// Auto-complete incoming tasks so the streaming call terminates fast.
-	peerStore.OnIncoming = func(m a2a.Message) { _ = peerStore.CompleteTask(m.TaskID, "ack") }
-	peer := httptest.NewServer((&a2a.Server{
-		Card:    a2a.AgentCard{Name: "peer"},
-		Handler: peerStore,
-		Log:     discardLog(),
-	}).Routes())
-	defer peer.Close()
+	peer.store.OnIncoming = func(e *InboxEntry) {
+		inbound <- *e
+		if err := peer.executor.CompleteTask(e.TaskID, "ack"); err != nil {
+			t.Errorf("peer CompleteTask: %v", err)
+		}
+	}
 
-	localStore := NewStore()
-	defer localStore.Close()
-	mcpSrv := newTestMCP(t, localStore)
-
-	resp := callTool(t, mcpSrv, "a2a_send_streaming", map[string]any{
-		"peer_url":  peer.URL,
+	local := NewStore()
+	defer local.Close()
+	resp := callTool(t, newTestMCP(t, local, NewExecutor(local, discardLog())), "a2a_send_streaming", map[string]any{
+		"peer_url":  peer.url,
 		"text":      "deploy key: " + testSecret,
 		"timeout_s": 10,
 	})
 	if strings.Contains(resp, testSecret) {
 		t.Error("streaming tool result leaked the raw secret")
 	}
-
-	// The peer must have received only the redacted text.
-	deadline := time.Now().Add(2 * time.Second)
-	var inboundText string
-	for time.Now().Before(deadline) {
-		tasks, _ := peerStore.ListTasks(context.Background())
-		if len(tasks) == 1 && len(tasks[0].History) > 0 {
-			inboundText = tasks[0].History[0].Parts[0].Text
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
+	if !strings.Contains(resp, string(a2a.TaskStateCompleted)) {
+		t.Errorf("streaming tool result has no completed event: %s", resp)
 	}
-	if inboundText == "" {
+
+	var got InboxEntry
+	select {
+	case got = <-inbound:
+	default:
 		t.Fatal("peer never received the streamed message")
 	}
-	if strings.Contains(inboundText, testSecret) {
+	if strings.Contains(got.Text, testSecret) {
 		t.Error("raw secret crossed the wire via send_streaming")
 	}
-	if !strings.Contains(inboundText, "[REDACTED:github-token]") {
-		t.Errorf("peer received unredacted text: %q", inboundText)
+	if !strings.Contains(got.Text, "[REDACTED:github-token]") {
+		t.Errorf("peer received unredacted text: %q", got.Text)
+	}
+	if got.From != "self" {
+		t.Errorf("peer saw from = %q, want self", got.From)
+	}
+}
+
+// TestSendMessageToolDeliversReplyToInbox — a non-blocking a2a_send_message
+// tracks the outgoing task; when the peer answers, the reply subscription
+// drops a synthetic entry into the sender's inbox.
+func TestSendMessageToolDeliversReplyToInbox(t *testing.T) {
+	peer := newTestAgent(t, "peer")
+	local := NewStore()
+	defer local.Close()
+
+	resp := callTool(t, newTestMCP(t, local, NewExecutor(local, discardLog())), "a2a_send_message", map[string]any{
+		"peer_url": peer.url,
+		"text":     "ping " + testSecret,
+	})
+	if strings.Contains(resp, testSecret) || strings.Contains(resp, `"isError":true`) {
+		t.Fatalf("send_message result = %s", resp)
+	}
+
+	entry := peer.firstInboxEntry(t)
+	if !strings.Contains(entry.Text, "[REDACTED:github-token]") || entry.From != "self" {
+		t.Fatalf("peer inbox entry = %+v", entry)
+	}
+	if err := peer.executor.CompleteTask(entry.TaskID, "pong"); err != nil {
+		t.Fatalf("peer CompleteTask: %v", err)
+	}
+
+	var reply InboxEntry
+	waitFor(t, "synthetic reply in the sender's inbox", func() bool {
+		local.mu.Lock()
+		defer local.mu.Unlock()
+		if len(local.inbox) == 0 {
+			return false
+		}
+		reply = local.inbox[0]
+		return true
+	})
+	if reply.TaskID != entry.TaskID || reply.Kind != KindOutgoingReply || reply.From != "peer" {
+		t.Fatalf("synthetic reply = %+v", reply)
+	}
+	if !strings.HasPrefix(reply.Text, "[ОТВЕТ от peer на твой вопрос «ping [REDACTED:github-token]»]") || !strings.HasSuffix(reply.Text, "\npong") {
+		t.Errorf("synthetic reply text = %q", reply.Text)
 	}
 }

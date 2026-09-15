@@ -5,7 +5,7 @@ import (
 	"io"
 	"runtime"
 
-	"github.com/vbcherepanov/a2abridge/internal/buildinfo"
+	"github.com/vbcherepanov/a2abridge/v4/internal/buildinfo"
 )
 
 // RunVersion prints semver, commit, build date, Go runtime and target os/arch.

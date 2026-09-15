@@ -1,97 +1,65 @@
 package agent
 
 import (
-	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/vbcherepanov/a2abridge/internal/a2a"
+	"github.com/a2aproject/a2a-go/v2/a2a"
 )
 
-// TestSendMessageCreatesTaskAndInboxEntry verifies the core round-trip:
-// a peer's SendMessage produces a SUBMITTED task in the store and pushes
-// the message into our inbox so MCP tools (and the UserPromptSubmit hook)
-// can drain it.
-func TestSendMessageCreatesTaskAndInboxEntry(t *testing.T) {
+func completedTask(id, reply string) *a2a.Task {
+	return &a2a.Task{
+		ID:        a2a.TaskID(id),
+		Status:    a2a.TaskStatus{State: a2a.TaskStateCompleted},
+		Artifacts: []*a2a.Artifact{{Parts: a2a.ContentParts{a2a.NewTextPart(reply)}}},
+	}
+}
+
+func incoming(id, taskID, text string) *InboxEntry {
+	return &InboxEntry{MessageID: id, TaskID: taskID, ContextID: "ctx-" + taskID, From: "peer-a", Text: text}
+}
+
+// TestDeliverIncomingQueuesAndFires verifies the inbound path: the entry is
+// queued and OnIncoming fires once.
+func TestDeliverIncomingQueuesAndFires(t *testing.T) {
 	s := NewStore()
-	var fired int32
-	s.OnIncoming = func(_ a2a.Message) { atomic.AddInt32(&fired, 1) }
+	defer s.Close()
+	var fired atomic.Int32
+	s.OnIncoming = func(*InboxEntry) { fired.Add(1) }
 
-	task, msg, err := s.SendMessage(context.Background(), a2a.MessageSendParams{
-		Message: a2a.Message{
-			MessageID: "m1",
-			Role:      a2a.RoleUser,
-			Parts:     []a2a.Part{{Text: "hello"}},
-		},
-	})
-	if err != nil {
-		t.Fatalf("send: %v", err)
+	if !s.deliverIncoming(incoming("m1", "t1", "hello")) {
+		t.Fatal("deliverIncoming = false for a new message")
 	}
-	if msg != nil {
-		t.Fatal("expected task, got Message variant")
-	}
-	if task == nil || task.Status.State != a2a.TaskStateSubmitted {
-		t.Fatalf("task state = %v, want SUBMITTED", task)
-	}
-
-	// inbox must contain exactly the message we sent
 	pending := s.PeekInbox()
-	if len(pending) != 1 {
-		t.Fatalf("inbox size = %d, want 1", len(pending))
+	if len(pending) != 1 || pending[0].MessageID != "m1" || pending[0].Text != "hello" {
+		t.Fatalf("inbox = %+v, want the delivered entry", pending)
 	}
-	if pending[0].MessageID != "m1" {
-		t.Errorf("inbox messageId = %q, want m1", pending[0].MessageID)
-	}
-
-	// OnIncoming fires asynchronously; poll briefly rather than sleep.
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if atomic.LoadInt32(&fired) == 1 {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	if got := atomic.LoadInt32(&fired); got != 1 {
-		t.Errorf("OnIncoming fired %d times, want 1", got)
-	}
-
-	// GetTask should return the same task we just created
-	got, err := s.GetTask(context.Background(), a2a.TaskIDParams{ID: task.ID})
-	if err != nil {
-		t.Fatalf("getTask: %v", err)
-	}
-	if got.ID != task.ID {
-		t.Errorf("GetTask id = %q, want %q", got.ID, task.ID)
-	}
+	waitFor(t, "OnIncoming", func() bool { return fired.Load() == 1 })
 }
 
 // TestPollOutgoingInjectsReply verifies the asymmetric reply-injection
 // path: when an outbound task we tracked completes on the peer's side,
-// PollOutgoing must drop a synthetic message into our inbox so the hook
+// PollOutgoing must drop a synthetic entry into our inbox so the hook
 // surfaces it on the next user prompt.
 func TestPollOutgoingInjectsReply(t *testing.T) {
 	s := NewStore()
+	defer s.Close()
 	s.TrackOutgoing("task-1", "http://peer/", "peer-A", "What is 2+2?")
 
-	fetcher := func(peerURL, taskID string) (*a2a.Task, error) {
-		return &a2a.Task{
-			ID:     taskID,
-			Status: a2a.TaskStatus{State: a2a.TaskStateCompleted},
-			Artifacts: []a2a.Artifact{
-				{Parts: []a2a.Part{{Text: "4"}}},
-			},
-		}, nil
+	fetcher := func(_, taskID string) (*a2a.Task, error) {
+		return completedTask(taskID, "4"), nil
 	}
 
-	completed := s.PollOutgoing(fetcher, 10*time.Minute)
-	if completed != 1 {
+	if completed := s.PollOutgoing(fetcher, 10*time.Minute); completed != 1 {
 		t.Fatalf("PollOutgoing returned %d, want 1", completed)
 	}
 
@@ -99,11 +67,12 @@ func TestPollOutgoingInjectsReply(t *testing.T) {
 	if len(pending) != 1 {
 		t.Fatalf("inbox size = %d, want 1", len(pending))
 	}
-	if pending[0].TaskID != "task-1" {
-		t.Errorf("synthetic taskID = %q, want task-1", pending[0].TaskID)
+	got := pending[0]
+	if got.TaskID != "task-1" || got.Kind != KindOutgoingReply || got.State != string(a2a.TaskStateCompleted) {
+		t.Errorf("synthetic entry = %+v", got)
 	}
-	if len(pending[0].Parts) == 0 || pending[0].Parts[0].Text == "" {
-		t.Errorf("synthetic message has no text part: %+v", pending[0])
+	if want := "[ОТВЕТ от peer-A на твой вопрос «What is 2+2?»]\n4"; got.Text != want {
+		t.Errorf("synthetic text = %q, want %q", got.Text, want)
 	}
 }
 
@@ -111,18 +80,19 @@ func TestPollOutgoingInjectsReply(t *testing.T) {
 // indefinitely when peers never respond.
 func TestPollOutgoingDropsStaleTask(t *testing.T) {
 	s := NewStore()
+	defer s.Close()
 	s.TrackOutgoing("stale", "http://peer/", "peer", "?")
-	// reach inside to backdate SentAt — that's the simplest way to test
-	// the maxAge path without sleeping for real.
 	s.mu.Lock()
 	s.pendingOutgoing["stale"].SentAt = time.Now().Add(-1 * time.Hour)
 	s.mu.Unlock()
 
 	fetcher := func(_, _ string) (*a2a.Task, error) {
-		t.Fatal("fetcher should not be called for stale tasks")
-		return nil, nil
+		t.Error("fetcher should not be called for stale tasks")
+		return nil, errors.New("unexpected fetch")
 	}
-	_ = s.PollOutgoing(fetcher, 30*time.Minute)
+	if n := s.PollOutgoing(fetcher, 30*time.Minute); n != 0 {
+		t.Errorf("PollOutgoing = %d, want 0", n)
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -131,21 +101,15 @@ func TestPollOutgoingDropsStaleTask(t *testing.T) {
 	}
 }
 
-// TestIngestOutgoingTerminalSSEFastPath verifies that a Task with a
-// terminal state delivered via the SSE fast-path produces the same inbox
-// entry as the polling path — and removes the task from pendingOutgoing.
-func TestIngestOutgoingTerminalSSEFastPath(t *testing.T) {
+// TestIngestOutgoingTerminalFastPath verifies that a terminal Task from the
+// subscription fast-path produces the same inbox entry as the polling path —
+// and removes the task from pendingOutgoing.
+func TestIngestOutgoingTerminalFastPath(t *testing.T) {
 	s := NewStore()
+	defer s.Close()
 	s.TrackOutgoing("task-sse", "http://peer/", "peer-A", "ping")
 
-	delivered := s.IngestOutgoingTerminal(&a2a.Task{
-		ID:     "task-sse",
-		Status: a2a.TaskStatus{State: a2a.TaskStateCompleted},
-		Artifacts: []a2a.Artifact{
-			{Parts: []a2a.Part{{Text: "pong"}}},
-		},
-	})
-	if !delivered {
+	if !s.IngestOutgoingTerminal(completedTask("task-sse", "pong")) {
 		t.Fatal("IngestOutgoingTerminal should report delivered=true")
 	}
 
@@ -157,120 +121,69 @@ func TestIngestOutgoingTerminalSSEFastPath(t *testing.T) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.pendingOutgoing["task-sse"]; ok {
-		t.Errorf("pendingOutgoing still contains task-sse after SSE delivery")
+		t.Errorf("pendingOutgoing still contains task-sse after fast-path delivery")
 	}
 }
 
-// TestIngestOutgoingTerminalIgnoresUntracked drops Tasks that were never
-// TrackOutgoing'd — otherwise stray peer notifications could grow the
-// inbox with junk.
-func TestIngestOutgoingTerminalIgnoresUntracked(t *testing.T) {
-	s := NewStore()
-	if got := s.IngestOutgoingTerminal(&a2a.Task{
-		ID:     "ghost",
-		Status: a2a.TaskStatus{State: a2a.TaskStateCompleted},
-	}); got {
-		t.Error("delivered=true for an untracked task")
-	}
-	if len(s.PeekInbox()) != 0 {
-		t.Error("inbox grew despite untracked task")
-	}
-}
-
-// TestGetTaskNotFoundReturnsSentinel — handlers translate this sentinel
-// to JSON-RPC code -32001 (TaskNotFound). Worth a single guard test.
-func TestGetTaskNotFoundReturnsSentinel(t *testing.T) {
+// TestIngestOutgoingTerminalIgnoresUntrackedAndLive drops Tasks that were
+// never tracked or are not terminal yet.
+func TestIngestOutgoingTerminalIgnoresUntrackedAndLive(t *testing.T) {
 	s := NewStore()
 	defer s.Close()
-	_, err := s.GetTask(context.Background(), a2a.TaskIDParams{ID: "nope"})
-	if err == nil {
-		t.Fatal("expected error, got nil")
+	if s.IngestOutgoingTerminal(completedTask("ghost", "boo")) {
+		t.Error("delivered=true for an untracked task")
 	}
-	if !errors.Is(err, a2a.ErrTaskNotFound) {
-		t.Errorf("err = %v, want a2a.ErrTaskNotFound", err)
+	s.TrackOutgoing("live", "http://peer/", "peer-A", "q")
+	if s.IngestOutgoingTerminal(&a2a.Task{ID: "live", Status: a2a.TaskStatus{State: a2a.TaskStateWorking}}) {
+		t.Error("delivered=true for a working task")
+	}
+	if s.IngestOutgoingTerminal(nil) {
+		t.Error("delivered=true for nil")
+	}
+	if len(s.PeekInbox()) != 0 {
+		t.Error("inbox grew despite untracked / live tasks")
 	}
 }
 
-// TestPollOutgoingSkipsAlreadyDelivered reproduces the SSE-vs-poll race:
-// the SSE fast path delivers the reply while PollOutgoing is mid network
-// fetch. The poll path must re-check pendingOutgoing membership under the
-// lock and skip — otherwise the inbox gets the same reply twice.
+// TestPollOutgoingSkipsAlreadyDelivered reproduces the stream-vs-poll race:
+// the fast path delivers the reply while PollOutgoing is mid network fetch.
 func TestPollOutgoingSkipsAlreadyDelivered(t *testing.T) {
 	s := NewStore()
 	defer s.Close()
 	s.TrackOutgoing("task-race", "http://peer/", "peer-A", "ping")
 
-	terminal := &a2a.Task{
-		ID:        "task-race",
-		Status:    a2a.TaskStatus{State: a2a.TaskStateCompleted},
-		Artifacts: []a2a.Artifact{{Parts: []a2a.Part{{Text: "pong"}}}},
-	}
+	terminal := completedTask("task-race", "pong")
 	fetcher := func(_, _ string) (*a2a.Task, error) {
-		// Simulate the SSE fast path winning while the poll loop is
-		// inside its network fetch (the lock is not held here).
 		if !s.IngestOutgoingTerminal(terminal) {
-			t.Fatal("SSE fast path should have delivered")
+			t.Error("fast path should have delivered")
 		}
 		return terminal, nil
 	}
 
 	if got := s.PollOutgoing(fetcher, 10*time.Minute); got != 0 {
-		t.Errorf("PollOutgoing completed = %d, want 0 (SSE already delivered)", got)
+		t.Errorf("PollOutgoing completed = %d, want 0 (fast path already delivered)", got)
 	}
 	if pending := s.PeekInbox(); len(pending) != 1 {
 		t.Fatalf("inbox size = %d, want 1 (no double delivery)", len(pending))
 	}
 }
 
-// TestEvictTerminalTasks covers the janitor: terminal tasks past the TTL
-// are evicted together with their push configs; fresh terminal tasks and
-// non-terminal tasks survive.
-func TestEvictTerminalTasks(t *testing.T) {
-	s := NewStore()
-	defer s.Close()
-
-	// old terminal task
-	doneTask, _, err := s.SendMessage(context.Background(), a2a.MessageSendParams{
-		Message: a2a.Message{Role: a2a.RoleUser, Parts: []a2a.Part{{Text: "q"}}},
-	})
-	if err != nil {
-		t.Fatal(err)
+// TestExtractReplyTextFallsBackToStatusMessage: without artifacts the reply
+// comes from the status message.
+func TestExtractReplyTextFallsBackToStatusMessage(t *testing.T) {
+	task := &a2a.Task{Status: a2a.TaskStatus{
+		State:   a2a.TaskStateCompleted,
+		Message: a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart("from status")),
+	}}
+	if got := extractReplyText(task); got != "from status" {
+		t.Fatalf("extractReplyText = %q, want from status", got)
 	}
-	if err := s.CompleteTask(doneTask.ID, "a"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.CreatePushConfig(context.Background(), a2a.TaskPushNotificationConfig{
-		TaskID: doneTask.ID,
-		Config: a2a.PushNotificationConfig{URL: "http://wh"},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	s.mu.Lock()
-	s.tasks[doneTask.ID].Status.Timestamp = time.Now().Add(-2 * terminalTaskTTL)
-	s.mu.Unlock()
-
-	// live (non-terminal) task — must never be evicted regardless of age
-	liveTask, _, err := s.SendMessage(context.Background(), a2a.MessageSendParams{
-		Message: a2a.Message{Role: a2a.RoleUser, Parts: []a2a.Part{{Text: "q2"}}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	s.mu.Lock()
-	s.tasks[liveTask.ID].Status.Timestamp = time.Now().Add(-2 * terminalTaskTTL)
-	s.mu.Unlock()
-
-	if got := s.evictTerminal(time.Now()); got != 1 {
-		t.Fatalf("evictTerminal = %d, want 1", got)
-	}
-	if _, err := s.GetTask(context.Background(), a2a.TaskIDParams{ID: doneTask.ID}); !errors.Is(err, a2a.ErrTaskNotFound) {
-		t.Errorf("evicted task GetTask err = %v, want ErrTaskNotFound", err)
-	}
-	if _, err := s.GetTask(context.Background(), a2a.TaskIDParams{ID: liveTask.ID}); err != nil {
-		t.Errorf("live task evicted: %v", err)
-	}
-	if cfgs, _ := s.ListPushConfigs(context.Background(), doneTask.ID); len(cfgs) != 0 {
-		t.Errorf("push configs survived eviction: %d", len(cfgs))
+	multi := &a2a.Task{Artifacts: []*a2a.Artifact{
+		{Parts: a2a.ContentParts{a2a.NewTextPart("a"), a2a.NewDataPart(map[string]any{"k": 1})}},
+		{Parts: a2a.ContentParts{a2a.NewTextPart("b")}},
+	}}
+	if got := extractReplyText(multi); got != "a\nb" {
+		t.Fatalf("extractReplyText = %q, want a\\nb", got)
 	}
 }
 
@@ -284,103 +197,50 @@ func TestPersistInboxFileMode(t *testing.T) {
 	defer s.Close()
 	s.InboxPath = filepath.Join(t.TempDir(), "inbox.json")
 
-	if _, _, err := s.SendMessage(context.Background(), a2a.MessageSendParams{
-		Message: a2a.Message{Role: a2a.RoleUser, Parts: []a2a.Part{{Text: "private"}}},
-	}); err != nil {
-		t.Fatal(err)
-	}
+	s.deliverIncoming(incoming("m1", "t1", "private"))
 	info, err := os.Stat(s.InboxPath)
 	if err != nil {
 		t.Fatalf("inbox snapshot missing: %v", err)
 	}
-	if got := info.Mode().Perm(); got != 0o600 {
-		t.Errorf("inbox file mode = %o, want 600", got)
+	if got := info.Mode().Perm(); got != inboxFileMode {
+		t.Errorf("inbox file mode = %o, want %o", got, inboxFileMode)
 	}
 }
 
-// TestSendMessageRejectsTerminalTask — a completed task accepts no more
-// input; appending would re-notify subscribers with a stale final status.
-func TestSendMessageRejectsTerminalTask(t *testing.T) {
+// TestSnapshotShapeForHook — the hook reads a JSON array of objects with
+// messageId/taskId/contextId/from/text and optional ts, nothing else.
+func TestSnapshotShapeForHook(t *testing.T) {
 	s := NewStore()
 	defer s.Close()
-	task, _, err := s.SendMessage(context.Background(), a2a.MessageSendParams{
-		Message: a2a.Message{Role: a2a.RoleUser, Parts: []a2a.Part{{Text: "q"}}},
-	})
+	s.InboxPath = filepath.Join(t.TempDir(), "inbox.json")
+	s.deliverIncoming(incoming("m1", "t1", "hi"))
+	s.TrackOutgoing("out-1", "http://peer/", "peer-B", "q")
+	s.IngestOutgoingTerminal(completedTask("out-1", "answer"))
+
+	b, err := os.ReadFile(s.InboxPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CompleteTask(task.ID, "done"); err != nil {
-		t.Fatal(err)
+	var snap []map[string]any
+	if err := json.Unmarshal(b, &snap); err != nil {
+		t.Fatalf("snapshot is not a JSON array of objects: %v", err)
 	}
-	if _, _, err := s.SendMessage(context.Background(), a2a.MessageSendParams{
-		Message: a2a.Message{TaskID: task.ID, Role: a2a.RoleUser, Parts: []a2a.Part{{Text: "more"}}},
-	}); err == nil {
-		t.Fatal("SendMessage into terminal task should error")
+	if len(snap) != 2 {
+		t.Fatalf("snapshot entries = %d, want 2", len(snap))
 	}
-}
-
-// TestNotifyFinalDeliveredUnderBackpressure — when a subscriber's buffer
-// is full, intermediate events may drop, but the terminal (Final) event
-// must still arrive and the channel must be closed afterwards.
-func TestNotifyFinalDeliveredUnderBackpressure(t *testing.T) {
-	s := NewStore()
-	defer s.Close()
-
-	ch := make(chan a2a.StreamResponse, 8)
-	s.mu.Lock()
-	s.subscribers["t"] = append(s.subscribers["t"], ch)
-	// Fill the buffer with 8 non-final events, then push the final one.
-	for range 8 {
-		s.notifyLocked("t", a2a.StreamResponse{
-			StatusUpdate: &a2a.TaskStatusUpdateEvent{TaskID: "t", Status: a2a.TaskStatus{State: a2a.TaskStateWorking}},
-		})
+	wantKeys := [][]string{
+		{"contextId", "from", "messageId", "taskId", "text"},
+		{"contextId", "from", "messageId", "taskId", "text", "ts"},
 	}
-	s.notifyLocked("t", a2a.StreamResponse{
-		StatusUpdate: &a2a.TaskStatusUpdateEvent{TaskID: "t", Status: a2a.TaskStatus{State: a2a.TaskStateCompleted}, Final: true},
-	})
-	s.mu.Unlock()
-
-	sawFinal := false
-	for ev := range ch { // terminates only if notifyLocked closed the channel
-		if ev.StatusUpdate != nil && ev.StatusUpdate.Final {
-			sawFinal = true
+	for i, entry := range snap {
+		keys := make([]string, 0, len(entry))
+		for k := range entry {
+			keys = append(keys, k)
 		}
-	}
-	if !sawFinal {
-		t.Error("final event was dropped under backpressure")
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.subscribers["t"]) != 0 {
-		t.Error("subscriber bookkeeping not cleaned up after final event")
-	}
-}
-
-// TestSubscribeStopsWhenConsumerGone — a consumer that stops reading must
-// not leak the Subscribe goroutine: every send is ctx-guarded.
-func TestSubscribeStopsWhenConsumerGone(t *testing.T) {
-	s := NewStore()
-	defer s.Close()
-	task, _, err := s.SendMessage(context.Background(), a2a.MessageSendParams{
-		Message: a2a.Message{Role: a2a.RoleUser, Parts: []a2a.Part{{Text: "q"}}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	out := make(chan a2a.StreamResponse) // unbuffered, never read
-	done := make(chan error, 1)
-	go func() { done <- s.Subscribe(ctx, task.ID, out) }()
-
-	cancel() // consumer is gone
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Error("Subscribe returned nil, want ctx error")
+		sort.Strings(keys)
+		if fmt.Sprint(keys) != fmt.Sprint(wantKeys[i]) {
+			t.Errorf("entry %d keys = %v, want %v", i, keys, wantKeys[i])
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Subscribe goroutine leaked: blocked on send to dead consumer")
 	}
 }
 
@@ -396,44 +256,45 @@ func TestTrimToRuneSafe(t *testing.T) {
 	}
 }
 
-// TestSendMessageDedupByMessageID verifies effectively-once delivery: a
-// redelivered message (same MessageID) is not queued twice.
-func TestSendMessageDedupByMessageID(t *testing.T) {
+// TestDeliverIncomingDedupByMessageID verifies effectively-once delivery: a
+// redelivered message (same MessageID) is not queued twice and its
+// side-effects don't fire again.
+func TestDeliverIncomingDedupByMessageID(t *testing.T) {
 	s := NewStore()
-	params := a2a.MessageSendParams{Message: a2a.Message{
-		MessageID: "dup1", Role: a2a.RoleUser, Parts: []a2a.Part{{Text: "hi"}},
-	}}
-	if _, _, err := s.SendMessage(context.Background(), params); err != nil {
-		t.Fatalf("send 1: %v", err)
+	defer s.Close()
+	var fired atomic.Int32
+	s.OnIncoming = func(*InboxEntry) { fired.Add(1) }
+
+	if !s.deliverIncoming(incoming("dup1", "t1", "hi")) {
+		t.Fatal("first delivery rejected")
 	}
-	if _, _, err := s.SendMessage(context.Background(), params); err != nil {
-		t.Fatalf("send 2 (redelivery): %v", err)
+	if s.deliverIncoming(incoming("dup1", "t2", "hi")) {
+		t.Fatal("redelivery accepted")
 	}
 	if got := len(s.PeekInbox()); got != 1 {
 		t.Fatalf("inbox size = %d after redelivery, want 1 (dedup)", got)
 	}
+	waitFor(t, "OnIncoming", func() bool { return fired.Load() == 1 })
+	time.Sleep(20 * time.Millisecond)
+	if got := fired.Load(); got != 1 {
+		t.Fatalf("OnIncoming fired %d times, want 1", got)
+	}
 }
 
-// TestLoadInboxRestoresSnapshot verifies durable delivery: messages persisted
+// TestLoadInboxRestoresSnapshot verifies durable delivery: entries persisted
 // to the snapshot are restored into a fresh store on startup (survive a bounce),
 // and a reload after drain is empty.
 func TestLoadInboxRestoresSnapshot(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "inbox.json")
 
 	s1 := NewStore()
+	defer s1.Close()
 	s1.InboxPath = path
-	if _, _, err := s1.SendMessage(context.Background(), a2a.MessageSendParams{
-		Message: a2a.Message{
-			MessageID: "keep1", Role: a2a.RoleUser,
-			Parts:    []a2a.Part{{Text: "survive me"}},
-			Metadata: map[string]any{"from": "peer-a"},
-		},
-	}); err != nil {
-		t.Fatalf("send: %v", err)
-	}
+	s1.deliverIncoming(&InboxEntry{MessageID: "keep1", TaskID: "t1", ContextID: "c1", From: "peer-a", Text: "survive me"})
 
 	// Simulate a bounce: a brand-new store pointed at the same snapshot.
 	s2 := NewStore()
+	defer s2.Close()
 	s2.InboxPath = path
 	s2.LoadInbox()
 
@@ -441,14 +302,9 @@ func TestLoadInboxRestoresSnapshot(t *testing.T) {
 	if len(pending) != 1 {
 		t.Fatalf("restored inbox size = %d, want 1", len(pending))
 	}
-	if pending[0].MessageID != "keep1" {
-		t.Errorf("restored messageId = %q, want keep1", pending[0].MessageID)
-	}
-	if len(pending[0].Parts) == 0 || pending[0].Parts[0].Text != "survive me" {
-		t.Errorf("restored text = %+v, want 'survive me'", pending[0].Parts)
-	}
-	if from, _ := pending[0].Metadata["from"].(string); from != "peer-a" {
-		t.Errorf("restored from = %q, want peer-a", from)
+	want := InboxEntry{MessageID: "keep1", TaskID: "t1", ContextID: "c1", From: "peer-a", Text: "survive me"}
+	if pending[0] != want {
+		t.Errorf("restored entry = %+v, want %+v", pending[0], want)
 	}
 
 	// Drain, then a fresh reload of the now-empty snapshot must be a no-op.
@@ -456,10 +312,23 @@ func TestLoadInboxRestoresSnapshot(t *testing.T) {
 		t.Fatalf("drain = %d, want 1", len(drained))
 	}
 	s3 := NewStore()
+	defer s3.Close()
 	s3.InboxPath = path
 	s3.LoadInbox()
 	if got := len(s3.PeekInbox()); got != 0 {
 		t.Fatalf("reload after drain = %d, want 0", got)
+	}
+
+	// The hook truncates the snapshot after rendering; that is a fresh start too.
+	if err := os.WriteFile(path, nil, inboxFileMode); err != nil {
+		t.Fatal(err)
+	}
+	s4 := NewStore()
+	defer s4.Close()
+	s4.InboxPath = path
+	s4.LoadInbox()
+	if got := len(s4.PeekInbox()); got != 0 {
+		t.Fatalf("reload of truncated snapshot = %d, want 0", got)
 	}
 }
 
@@ -467,54 +336,46 @@ func TestLoadInboxRestoresSnapshot(t *testing.T) {
 // entries are dropped (a stuck/never-drained bridge can't grow without bound).
 func TestInboxSoftCap(t *testing.T) {
 	s := NewStore()
+	defer s.Close()
 	total := inboxSoftCap + 25
-	for i := 0; i < total; i++ {
-		if _, _, err := s.SendMessage(context.Background(), a2a.MessageSendParams{
-			Message: a2a.Message{MessageID: fmt.Sprintf("m%05d", i), Role: a2a.RoleUser, Parts: []a2a.Part{{Text: "x"}}},
-		}); err != nil {
-			t.Fatalf("send %d: %v", i, err)
-		}
+	for i := range total {
+		s.deliverIncoming(incoming(fmt.Sprintf("m%05d", i), fmt.Sprintf("t%05d", i), "x"))
 	}
 	pending := s.PeekInbox()
 	if len(pending) != inboxSoftCap {
 		t.Fatalf("inbox size = %d, want soft cap %d", len(pending), inboxSoftCap)
 	}
 	// Oldest dropped → first survivor is index (total-cap).
-	want := fmt.Sprintf("m%05d", total-inboxSoftCap)
-	if pending[0].MessageID != want {
+	if want := fmt.Sprintf("m%05d", total-inboxSoftCap); pending[0].MessageID != want {
 		t.Errorf("oldest survivor = %q, want %q", pending[0].MessageID, want)
 	}
 }
 
 // TestCompleteTaskClearsOutgoingReplyNotification: a synthetic outgoing-reply
-// (its TaskID is an outgoing task, absent from s.tasks) is cleared by
+// (its TaskID is an outgoing task with no local execution) is cleared by
 // CompleteTask rather than returning ErrTaskNotFound, so it does not keep the
 // inbox snapshot non-empty. A second delivery of the same task is a no-op.
 func TestCompleteTaskClearsOutgoingReplyNotification(t *testing.T) {
 	s := NewStore()
 	defer s.Close()
 	s.InboxPath = filepath.Join(t.TempDir(), "inbox.json")
-	// PeekInbox now consumes one-shot outgoing-replies (the wake-spam fix), so this
+	e := NewExecutor(s, discardLog())
+	// PeekInbox consumes one-shot outgoing-replies (the wake-spam fix), so this
 	// test reads s.inbox directly to verify the CompleteTask clear-path without the
 	// peek-consume side effect.
 	inboxLen := func() int { s.mu.Lock(); defer s.mu.Unlock(); return len(s.inbox) }
 
-	// peer completes an outgoing task; the SSE fast-path renders the reply.
-	// Reply text must be non-empty: empty completions are suppressed (no inbox
-	// entry) by appendSyntheticReply, so a contentful reply is what exercises
-	// the CompleteTask clear-path this test covers.
 	s.TrackOutgoing("out-1", "http://peer/", "peer-A", "What is 2+2?")
 	if !s.IngestOutgoingTerminal(&a2a.Task{
 		ID: "out-1",
 		Status: a2a.TaskStatus{
 			State:   a2a.TaskStateCompleted,
-			Message: &a2a.Message{Parts: []a2a.Part{{Text: "4"}}},
+			Message: a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart("4")),
 		},
 	}) {
 		t.Fatal("IngestOutgoingTerminal should deliver the tracked reply")
 	}
 
-	// reply is in the inbox and the persisted snapshot.
 	if got := inboxLen(); got != 1 {
 		t.Fatalf("inbox len after reply = %d, want 1", got)
 	}
@@ -526,8 +387,7 @@ func TestCompleteTaskClearsOutgoingReplyNotification(t *testing.T) {
 		t.Fatalf("inbox file should contain the outgoing-reply taskId; got %s", before)
 	}
 
-	// ack clears it (was ErrTaskNotFound).
-	if err := s.CompleteTask("out-1", ""); err != nil {
+	if err := e.CompleteTask("out-1", ""); err != nil {
 		t.Fatalf("CompleteTask(outgoing-reply id) = %v, want nil", err)
 	}
 	if got := inboxLen(); got != 0 {
@@ -541,20 +401,25 @@ func TestCompleteTaskClearsOutgoingReplyNotification(t *testing.T) {
 		t.Fatalf("inbox file still retains the outgoing-reply after ack: %s", after)
 	}
 
-	// second delivery is a no-op: pendingOutgoing was deleted on first delivery.
-	if s.IngestOutgoingTerminal(&a2a.Task{
-		ID:     "out-1",
-		Status: a2a.TaskStatus{State: a2a.TaskStateCompleted},
-	}) {
+	if s.IngestOutgoingTerminal(&a2a.Task{ID: "out-1", Status: a2a.TaskStatus{State: a2a.TaskStateCompleted}}) {
 		t.Fatal("second IngestOutgoingTerminal should be a no-op (already delivered)")
 	}
 	if got := inboxLen(); got != 0 {
 		t.Fatalf("inbox len after second ingest = %d, want 0 (reply re-appended)", got)
 	}
 
-	// unknown id with no inbox entry still reports not-found.
-	if err := s.CompleteTask("never-seen", ""); !errors.Is(err, a2a.ErrTaskNotFound) {
+	if err := e.CompleteTask("never-seen", ""); !errors.Is(err, a2a.ErrTaskNotFound) {
 		t.Fatalf("CompleteTask(unknown id) = %v, want ErrTaskNotFound", err)
+	}
+
+	// A genuine inbound entry restored without a live execution is dropped
+	// but still reported: nobody is waiting for the reply.
+	s.deliverIncoming(incoming("m-restored", "restored", "old question"))
+	if err := e.CompleteTask("restored", "late"); !errors.Is(err, a2a.ErrTaskNotFound) {
+		t.Fatalf("CompleteTask(restored entry) = %v, want ErrTaskNotFound", err)
+	}
+	if got := inboxLen(); got != 0 {
+		t.Fatalf("inbox len after completing restored entry = %d, want 0", got)
 	}
 }
 
@@ -563,13 +428,9 @@ func TestCompleteTaskClearsOutgoingReplyNotification(t *testing.T) {
 // empty "[ОТВЕТ …]" record in our inbox.
 func TestIngestOutgoingTerminalSkipsEmptyReply(t *testing.T) {
 	s := NewStore()
+	defer s.Close()
 	s.TrackOutgoing("task-empty", "http://peer/", "peer-A", "ping?")
-	ok := s.IngestOutgoingTerminal(&a2a.Task{
-		ID:     "task-empty",
-		Status: a2a.TaskStatus{State: a2a.TaskStateCompleted},
-		// no artifacts, no status message → empty reply text
-	})
-	if !ok {
+	if !s.IngestOutgoingTerminal(&a2a.Task{ID: "task-empty", Status: a2a.TaskStatus{State: a2a.TaskStateCompleted}}) {
 		t.Fatalf("IngestOutgoingTerminal = false, want true (tracked + terminal)")
 	}
 	if pending := s.PeekInbox(); len(pending) != 0 {
@@ -577,30 +438,34 @@ func TestIngestOutgoingTerminalSkipsEmptyReply(t *testing.T) {
 	}
 }
 
-// TestEvictTerminalReapsDeliveredOutgoingReplies verifies the stale-re-render
-// fix: aged one-shot outgoing-reply records are evicted by identity, while a
-// fresh reply and genuine incoming messages survive.
-func TestEvictTerminalReapsDeliveredOutgoingReplies(t *testing.T) {
+// TestEvictExpiredRepliesReapsDeliveredOutgoingReplies verifies the
+// stale-re-render fix: aged one-shot outgoing-reply records are evicted by
+// identity, while a fresh reply and genuine incoming messages survive.
+func TestEvictExpiredRepliesReapsDeliveredOutgoingReplies(t *testing.T) {
 	s := NewStore()
+	defer s.Close()
 	now := time.Now()
 	oldTS := now.Add(-20 * time.Minute).UTC().Format(time.RFC3339)
 	freshTS := now.UTC().Format(time.RFC3339)
 	s.mu.Lock()
-	s.inbox = []a2a.Message{
-		{MessageID: "reply-old", TaskID: "old", Metadata: map[string]any{"kind": "outgoing-reply", "ts": oldTS}},
-		{MessageID: "reply-fresh", TaskID: "fresh", Metadata: map[string]any{"kind": "outgoing-reply", "ts": freshTS}},
-		{MessageID: "incoming-1", TaskID: "inc"}, // genuine incoming, no ts → never evicted
+	s.inbox = []InboxEntry{
+		{MessageID: "reply-old", TaskID: "old", Kind: KindOutgoingReply, TS: oldTS},
+		{MessageID: "reply-fresh", TaskID: "fresh", Kind: KindOutgoingReply, TS: freshTS},
+		{MessageID: "incoming-1", TaskID: "inc", TS: oldTS}, // genuine incoming → never evicted
 	}
 	s.mu.Unlock()
 
-	s.evictTerminal(now)
-
-	got := s.PeekInbox()
-	if len(got) != 2 {
-		t.Fatalf("inbox size after evict = %d, want 2 (aged reply reaped)", len(got))
+	if got := s.evictExpiredReplies(now); got != 1 {
+		t.Fatalf("evictExpiredReplies = %d, want 1", got)
 	}
-	for _, m := range got {
-		if m.MessageID == "reply-old" {
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.inbox) != 2 {
+		t.Fatalf("inbox size after evict = %d, want 2 (aged reply reaped)", len(s.inbox))
+	}
+	for _, e := range s.inbox {
+		if e.MessageID == "reply-old" {
 			t.Fatal("reply-old should have been evicted")
 		}
 	}
@@ -614,10 +479,9 @@ func TestPeekConsumesOutgoingReply(t *testing.T) {
 	defer s.Close()
 	s.InboxPath = filepath.Join(t.TempDir(), "inbox.json")
 	s.mu.Lock()
-	s.inbox = []a2a.Message{
-		{MessageID: "incoming-1", TaskID: "t1", Parts: []a2a.Part{{Text: "hi"}}},
-		{MessageID: "reply-out1", TaskID: "out1", Parts: []a2a.Part{{Text: "done"}},
-			Metadata: map[string]any{"kind": "outgoing-reply"}},
+	s.inbox = []InboxEntry{
+		{MessageID: "incoming-1", TaskID: "t1", Text: "hi"},
+		{MessageID: "reply-out1", TaskID: "out1", Text: "done", Kind: KindOutgoingReply},
 	}
 	s.mu.Unlock()
 
@@ -640,15 +504,11 @@ func TestLoadInboxKeepsReplyTimestamp(t *testing.T) {
 	s := NewStore()
 	s.InboxPath = path
 	s.mu.Lock()
-	s.appendInboxLocked(&a2a.Message{
-		MessageID: "reply-task-1", TaskID: "task-1", Role: a2a.RoleAgent,
-		Parts:    []a2a.Part{{Text: "done"}},
-		Metadata: map[string]any{"from": "peer", "kind": "outgoing-reply", "ts": delivered},
+	s.appendInboxLocked(&InboxEntry{
+		MessageID: "reply-task-1", TaskID: "task-1", From: "peer", Text: "done",
+		Kind: KindOutgoingReply, TS: delivered,
 	})
-	s.appendInboxLocked(&a2a.Message{
-		MessageID: "incoming-1", TaskID: "task-2", Role: a2a.RoleUser,
-		Parts: []a2a.Part{{Text: "hello"}},
-	})
+	s.appendInboxLocked(&InboxEntry{MessageID: "incoming-1", TaskID: "task-2", Text: "hello"})
 	s.persistInboxLocked()
 	s.mu.Unlock()
 	s.Close()
@@ -657,7 +517,7 @@ func TestLoadInboxKeepsReplyTimestamp(t *testing.T) {
 	defer restored.Close()
 	restored.InboxPath = path
 	restored.LoadInbox()
-	restored.evictTerminal(time.Now())
+	restored.evictExpiredReplies(time.Now())
 
 	restored.mu.Lock()
 	defer restored.mu.Unlock()

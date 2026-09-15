@@ -47,7 +47,7 @@ Agent Card and picks the first one whose `skills` overlap the filter.
 
 ## Streaming
 
-LangGraph's stream nodes map cleanly onto `message/stream`.
+LangGraph's stream nodes map cleanly onto `SendStreamingMessage`.
 The adapter exposes `adapter.stream_send(...)` which yields each
 `statusUpdate` / `artifactUpdate` event.
 
