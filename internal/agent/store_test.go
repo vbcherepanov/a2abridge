@@ -640,12 +640,12 @@ func TestLoadInboxKeepsReplyTimestamp(t *testing.T) {
 	s := NewStore()
 	s.InboxPath = path
 	s.mu.Lock()
-	s.appendInboxLocked(a2a.Message{
+	s.appendInboxLocked(&a2a.Message{
 		MessageID: "reply-task-1", TaskID: "task-1", Role: a2a.RoleAgent,
 		Parts:    []a2a.Part{{Text: "done"}},
 		Metadata: map[string]any{"from": "peer", "kind": "outgoing-reply", "ts": delivered},
 	})
-	s.appendInboxLocked(a2a.Message{
+	s.appendInboxLocked(&a2a.Message{
 		MessageID: "incoming-1", TaskID: "task-2", Role: a2a.RoleUser,
 		Parts: []a2a.Part{{Text: "hello"}},
 	})

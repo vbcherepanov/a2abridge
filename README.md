@@ -417,6 +417,9 @@ Set per-bridge environment in your IDE config (the installer fills sensible defa
 | `A2A_MODEL` | unset | model id reported in Agent Card (`claude-opus-4-7`, `gpt-5`, ...) |
 | `A2A_SKILLS` | unset | comma-separated capability tags |
 | `A2A_STATE_DIR` | `./.a2a` | per-project inbox/label/log directory |
+| `A2A_NUDGE` | unset | wake an idle agent on inbound: `auto`, `tmux`, `terminal` (macOS Terminal.app) or `dtach` |
+| `A2A_NUDGE_SOCKET` | `~/.dtach/<name>` | dtach master socket used when `A2A_NUDGE=dtach` |
+| `A2A_RESPONDER` | unset | auto-answer inbound messages with a headless `claude` or `codex` CLI |
 
 Cross-machine federation: `A2A_TLS_CERT`, `A2A_TLS_KEY`, `A2A_TRUST_ROOTS` (required once cert/key are set), `A2A_PEER_ALLOW`.
 
@@ -426,7 +429,7 @@ The hardest thing to internalise is **when** peers see messages. Here's
 the model in 5 lines:
 
 1. Peer A calls `a2a_send_message peer_url=<B>` — task lands in B's
-   `Store` and B's `inbox` file (`./.a2a/inbox-<ppid>.json`).
+   `Store` and B's `inbox` file (`./.a2a/inbox.json`).
 2. B's UserPromptSubmit hook reads the inbox **on B's next prompt**
    from the human user — and prepends it to the system prompt.
 3. B answers the human. Within that turn (or the next) B can call
@@ -441,6 +444,11 @@ the sender** to see the reply. That is the same delay you'd have over
 DM with a colleague — the bridge doesn't wake idle agents, it just
 makes sure neither side misses the message.
 
+The inbox file is a durable snapshot: a bridge restart restores messages that
+were not drained yet, a redelivered message with the same `messageId` is queued
+once, and past 500 entries the oldest are dropped. One-shot reply notifications
+age out two minutes after delivery, also across a restart.
+
 ## Troubleshooting
 
 ```bash
@@ -452,7 +460,8 @@ Output is a table of checks, each PASS/WARN/FAIL with a fix hint. Typical failur
 - **directory not running** → `a2abridge service start`
 - **port 7777 in use** → `a2abridge service uninstall && a2abridge install --directory-port 7778`
 - **IDE config missing the MCP block** → re-run `a2abridge install --ide claude-code`
-- **inbox stale** → `rm -rf ./.a2a/inbox` (the bridge will rebuild on next message)
+- **inbox stale** → `rm ./.a2a/inbox.json` (the bridge rebuilds it on the next message)
+- **a bridge exits right after start with `port already held by another bridge, deferring`** → another bridge already serves this agent on that address; exactly one bridge runs per agent, and a bridge shuts down when its MCP host exits
 - **two Claude windows clobbering each other in the directory** → set distinct `A2A_ID` env per window
 
 Logs:
@@ -461,6 +470,8 @@ Logs:
 - Linux: `journalctl --user -u a2abridge-directory.service`
 - Windows: `Get-EventLog -LogName Application -Source a2abridge-directory`
 - Per-bridge: `./.a2a/bridge.log`
+
+Metrics: the directory and every bridge serve Prometheus metrics at `/metrics`.
 
 ## Compatibility
 

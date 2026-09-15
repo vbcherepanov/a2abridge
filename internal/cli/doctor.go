@@ -192,7 +192,7 @@ func checkHook() checkResult {
 		}
 	}
 	info, _ := os.Stat(hook)
-	if info != nil && info.Mode().Perm()&0o111 == 0 {
+	if runtime.GOOS != "windows" && info != nil && info.Mode().Perm()&0o111 == 0 {
 		return checkResult{
 			Name:   "hook",
 			Status: "WARN",

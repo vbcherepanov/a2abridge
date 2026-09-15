@@ -4,6 +4,47 @@ All notable changes to a2abridge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.0] — 2026-09-15
+
+Reliability release built on community fixes by
+[@terafin](https://github.com/terafin) (#9, #10, #12, #13, #14, #15, #18, #20).
+
+### Fixed
+
+- **Durable inbox.** The snapshot is restored on start and no longer deleted
+  on shutdown, redelivered messages are de-duplicated by `messageId`, and the
+  inbox is soft-capped at 500 entries (#12, #13).
+- **Outgoing-reply notifications no longer linger.** `CompleteTask` clears
+  them, contentless completions are skipped, delivered notifications age out,
+  and a peek consumes them once (#9, #10, #18).
+- **A restored reply notification keeps its delivery timestamp**, so a bridge
+  restart does not resurrect it on every wake.
+- **A bridge no longer outlives its MCP host.** It shuts down on stdin EOF and,
+  on Linux, on the parent-death signal (#20).
+- **One bridge per agent.** A second bridge on a held address retries briefly,
+  then defers to the incumbent and exits 0 (#20). On Windows the held port is
+  detected through `WSAEADDRINUSE`.
+- `a2abridge doctor` no longer suggests `chmod +x` for the hook on Windows (#19).
+
+### Added
+
+- Per-bridge `/metrics` endpoint (#14).
+- `A2A_NUDGE=dtach` backend with `A2A_NUDGE_SOCKET` (#15).
+
+### Changed
+
+- The inbox snapshot is a single `inbox.json` per state directory instead of
+  `inbox-<ppid>.json`. The hook still reads legacy files and prunes those whose
+  process is gone.
+- golangci-lint configuration migrated to the v2 format.
+
+### Tests
+
+- Windows: POSIX permission assertions are skipped and home-directory tests
+  set `USERPROFILE`, restoring a green Windows build.
+- Integration tests for parent death and single-bridge behaviour
+  (`go test -tags=integration ./internal/cli/`).
+
 ## [3.0.0] — 2026-06-10
 
 Spec-compliance and hardening release. The JSON-RPC wire format now

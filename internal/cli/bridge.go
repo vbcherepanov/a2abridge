@@ -84,7 +84,7 @@ func RunBridge(args []string, _, stderr io.Writer) int {
 		if err == nil {
 			break
 		}
-		if !errors.Is(err, syscall.EADDRINUSE) {
+		if !isAddrInUse(err) {
 			log.Error("listen", "err", err)
 			return 1
 		}

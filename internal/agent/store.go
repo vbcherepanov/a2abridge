@@ -157,7 +157,8 @@ func (s *Store) evictTerminal(now time.Time) int {
 	if len(s.inbox) > 0 {
 		replyCutoff := now.Add(-2 * time.Minute)
 		kept := s.inbox[:0]
-		for _, m := range s.inbox {
+		for i := range s.inbox {
+			m := &s.inbox[i]
 			if strings.HasPrefix(m.MessageID, "reply-") {
 				if ts, ok := m.Metadata["ts"].(string); ok {
 					if when, err := time.Parse(time.RFC3339, ts); err == nil && when.Before(replyCutoff) {
@@ -165,7 +166,7 @@ func (s *Store) evictTerminal(now time.Time) int {
 					}
 				}
 			}
-			kept = append(kept, m)
+			kept = append(kept, *m)
 		}
 		if len(kept) != len(s.inbox) {
 			s.inbox = kept
@@ -273,7 +274,7 @@ func (s *Store) appendSyntheticReply(p *pendingOutgoingTask, reply, state string
 		Metadata:  map[string]any{"from": p.PeerName, "kind": "outgoing-reply", "state": state, "ts": time.Now().UTC().Format(time.RFC3339)},
 	}
 	s.mu.Lock()
-	isNew := s.appendInboxLocked(synthetic)
+	isNew := s.appendInboxLocked(&synthetic)
 	if isNew {
 		s.persistInboxLocked()
 	}
@@ -371,11 +372,11 @@ func (s *Store) inboxContainsLocked(id string) bool {
 // past inboxSoftCap). Returns true if the message was newly queued, false if it
 // was a duplicate — callers use that to skip re-firing side-effects (hook,
 // responder, metrics). Must be called with s.mu held.
-func (s *Store) appendInboxLocked(m a2a.Message) bool {
+func (s *Store) appendInboxLocked(m *a2a.Message) bool {
 	if s.inboxContainsLocked(m.MessageID) {
 		return false
 	}
-	s.inbox = append(s.inbox, m)
+	s.inbox = append(s.inbox, *m)
 	if over := len(s.inbox) - inboxSoftCap; over > 0 {
 		s.logger().Warn("inbox soft-cap exceeded, dropping oldest", "cap", inboxSoftCap, "dropped", over)
 		s.inbox = append([]a2a.Message(nil), s.inbox[over:]...)
@@ -430,7 +431,7 @@ func (s *Store) LoadInbox() {
 		if len(meta) > 0 {
 			m.Metadata = meta
 		}
-		s.appendInboxLocked(m)
+		s.appendInboxLocked(&m)
 	}
 	metrics.SetInboxSize(len(s.inbox))
 	if len(s.inbox) > 0 {
@@ -536,7 +537,7 @@ func (s *Store) SendMessage(ctx context.Context, p a2a.MessageSendParams) (*a2a.
 	// Effectively-once: a redelivered message (same MessageID) is not
 	// re-queued, and its side-effects (history, hook, responder, metrics)
 	// are not re-fired. The sender still gets a valid task back.
-	isNew := s.appendInboxLocked(msg)
+	isNew := s.appendInboxLocked(&msg)
 	if isNew {
 		task.History = append(task.History, msg)
 		s.persistInboxLocked()
@@ -713,12 +714,13 @@ func (s *Store) PeekInbox() []a2a.Message {
 	// are untouched, so peeking pending tasks stays non-destructive.
 	kept := s.inbox[:0]
 	dropped := false
-	for _, m := range s.inbox {
+	for i := range s.inbox {
+		m := &s.inbox[i]
 		if strings.HasPrefix(m.MessageID, "reply-") {
 			dropped = true
 			continue
 		}
-		kept = append(kept, m)
+		kept = append(kept, *m)
 	}
 	if dropped {
 		s.inbox = kept
