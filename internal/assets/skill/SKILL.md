@@ -12,7 +12,7 @@ You are part of a distributed team of AI coding agents. Other Claude / Codex / C
 
 - Each peer is identified by an Agent Card on `/.well-known/agent-card.json` and a unique URL.
 - Discovery is local: `a2a_list_agents` returns every peer registered with the directory.
-- Conversations are tasks: `a2a_send_message` creates a task on a peer; the peer replies via `a2a_complete_task` (or another `a2a_send_message` with the same `task_id`).
+- Every message is its own task: `a2a_send_message` creates a task on the peer, which stays working until the peer answers with `a2a_complete_task`. Continue a conversation with a new message that reuses the `context_id` of the previous task. Pass `task_id` only for a task that is waiting for input — A2A 1.0 rejects messages to a task that is still being worked on or already finished.
 - Your incoming queue is `a2a_inbox`. Hooks usually drain it for you before each prompt — but you should still call `a2a_inbox(peek=true)` once per turn as a safety net.
 
 ## Self-label
@@ -66,8 +66,8 @@ Transport: `a2a_send_message` (fire-and-forget). Do **not** use `a2a_send_stream
 ```
 a2a_whoami                 # your own Agent Card
 a2a_list_agents            # all peers registered with the directory
-a2a_send_message(peer_url=, text=, task_id?, blocking?)
-a2a_send_streaming(peer_url=, text=)
+a2a_send_message(peer_url=, text=, context_id?, task_id?, blocking?)
+a2a_send_streaming(peer_url=, text=, timeout_s?)
 a2a_get_task(peer_url=, task_id=)
 a2a_cancel_task(peer_url=, task_id=)
 a2a_inbox(peek?=)

@@ -8,7 +8,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/vbcherepanov/a2abridge/internal/buildinfo"
+	"github.com/vbcherepanov/a2abridge/v4/internal/buildinfo"
 )
 
 // Command is a single subcommand registered with the dispatcher.

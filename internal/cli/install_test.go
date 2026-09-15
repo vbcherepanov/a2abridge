@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/vbcherepanov/a2abridge/internal/ideconfig"
+	"github.com/vbcherepanov/a2abridge/v4/internal/ideconfig"
 )
 
 func TestParseIDEFilter(t *testing.T) {
@@ -48,6 +48,7 @@ func TestWriterSlugCanonical(t *testing.T) {
 		"Cline (VS Code)": "cline",
 		"Continue":        "continue",
 		"Gemini CLI":      "gemini",
+		"Antigravity CLI": "antigravity",
 	}
 	for _, w := range ideconfig.AllWriters() {
 		want, ok := cases[w.Name()]

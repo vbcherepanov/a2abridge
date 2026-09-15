@@ -69,7 +69,7 @@ same env flag.
 ## Caveats
 
 - ADK 1.0 still ships some agents with `streaming=False` in the Agent
-  Card. a2abridge falls back to non-streaming `message/send` automatically
+  Card. a2abridge falls back to non-streaming `SendMessage` automatically
   when `card.capabilities.streaming` is false.
 - ADK uses `protocolVersion: "1.0"` per spec. If you see version errors
   in `a2abridge doctor`, both sides need to be on protocol 1.0+.

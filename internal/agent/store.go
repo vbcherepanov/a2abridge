@@ -1,11 +1,10 @@
-// Package agent contains the local A2A Handler implementation used by the bridge.
-// It holds an in-memory task store and an inbox of messages addressed to this agent.
+// Package agent contains the local A2A agent used by the bridge: the durable
+// inbox the host (Claude/Codex) drains through MCP tools, outgoing task
+// tracking, the a2a-go executor and the HTTP assembly around it.
 package agent
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -13,41 +12,82 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
-	"github.com/vbcherepanov/a2abridge/internal/a2a"
-	"github.com/vbcherepanov/a2abridge/internal/metrics"
+	"github.com/a2aproject/a2a-go/v2/a2a"
+
+	"github.com/vbcherepanov/a2abridge/v4/internal/metrics"
 )
 
-// Janitor knobs. Terminal tasks are kept around for a grace period so
-// late GetTask / resubscribe calls still resolve, then evicted to keep
-// the in-memory store bounded on long-lived bridges.
+// Janitor knobs.
 const (
-	terminalTaskTTL = 30 * time.Minute
 	janitorInterval = time.Minute
 
 	// inboxSoftCap bounds the persisted inbox. An inbox is normally drained
 	// every turn; a soft cap keeps a stuck/never-drained bridge from growing
 	// the snapshot without bound. Oldest entries are dropped past this.
 	inboxSoftCap = 500
+
+	// replyEntryTTL is how long a delivered one-shot outgoing-reply entry
+	// stays in the inbox before the janitor reaps it.
+	replyEntryTTL = 2 * time.Minute
+
+	// replyMessageIDPrefix marks synthetic outgoing-reply entries. The prefix
+	// survives the on-disk snapshot, so it is the identity used after a restart.
+	replyMessageIDPrefix = "reply-"
+
+	// KindOutgoingReply is the InboxEntry.Kind of a synthetic reply to a task
+	// this agent sent to a peer.
+	KindOutgoingReply = "outgoing-reply"
+
+	// inboxFileMode — the snapshot carries full inter-agent message text;
+	// other local users have no business reading it.
+	inboxFileMode = 0o600
 )
 
-// Store implements a2a.Handler for a local agent.
-// Incoming SendMessage calls create a task in SUBMITTED state and push the message
-// onto the inbox so the host (Claude/Codex) can pick it up via MCP tools and reply.
+// InboxEntry is one message waiting for the host: either a peer's inbound
+// task or a synthetic reply to a task this agent sent.
+type InboxEntry struct {
+	MessageID string `json:"messageId"`
+	TaskID    string `json:"taskId"`
+	ContextID string `json:"contextId"`
+	From      string `json:"from"`
+	Text      string `json:"text"`
+	Kind      string `json:"kind,omitempty"`
+	State     string `json:"state,omitempty"`
+	TS        string `json:"ts,omitempty"`
+}
+
+// isSyntheticReply reports whether the entry is a synthetic outgoing-reply
+// the store injected for one of our own outbound tasks.
+func (e *InboxEntry) isSyntheticReply() bool {
+	return e.Kind == KindOutgoingReply || strings.HasPrefix(e.MessageID, replyMessageIDPrefix)
+}
+
+// snapshotEntry is the hook-facing on-disk projection of an InboxEntry.
+// internal/assets/hook/a2a-inbox-hook.sh reads exactly these fields.
+type snapshotEntry struct {
+	MessageID string `json:"messageId"`
+	TaskID    string `json:"taskId"`
+	ContextID string `json:"contextId"`
+	From      string `json:"from"`
+	Text      string `json:"text"`
+	TS        string `json:"ts,omitempty"`
+}
+
+// Store holds the durable inbox of messages addressed to this agent and the
+// outgoing tasks this agent is waiting on. Task state itself lives in the
+// a2a-go task store (TTLStore); the Store only knows what the host sees.
 type Store struct {
-	mu          sync.Mutex
-	tasks       map[string]*a2a.Task
-	subscribers map[string][]chan a2a.StreamResponse
-	inbox       []a2a.Message // incoming messages awaiting host handling
+	mu    sync.Mutex
+	inbox []InboxEntry
 
 	// InboxPath — optional file path. Whenever the inbox changes the store
 	// writes a JSON snapshot there so external hooks (UserPromptSubmit) can
 	// read pending messages without going through MCP.
 	InboxPath string
 
-	// OnIncoming — optional async hook fired after a message is appended to inbox.
+	// OnIncoming — optional async hook fired after an entry is appended to inbox.
 	// Used by the autonomous responder to spawn `claude -p` / `codex exec`.
-	OnIncoming func(a2a.Message)
+	OnIncoming func(*InboxEntry)
 
 	// Outgoing task tracking: когда этот агент отправляет сообщение пиру,
 	// мы запоминаем task_id + peer_url и фоново опрашиваем пока не COMPLETED.
@@ -55,44 +95,12 @@ type Store struct {
 	// UserPromptSubmit hook его инжектнул в следующий промпт пользователя.
 	pendingOutgoing map[string]*pendingOutgoingTask
 
-	// Push — webhook registry per A2A 1.0 §9.5. Bridges register peer
-	// webhooks here; Store calls Notify on every task state change so
-	// subscribers without an open SSE stream still see updates.
-	Push *PushStore
-
 	// Log — optional structured logger for background failures (inbox
 	// persistence, janitor). nil falls back to slog.Default().
 	Log *slog.Logger
 
 	janitorStop chan struct{}
 	closeOnce   sync.Once
-}
-
-// logger returns the configured logger or the process default.
-func (s *Store) logger() *slog.Logger {
-	if s.Log != nil {
-		return s.Log
-	}
-	return slog.Default()
-}
-
-// CreatePushConfig / GetPushConfig / ListPushConfigs / DeletePushConfig:
-// thin pass-throughs that turn Store into an a2a.PushHandler. We forward
-// to the embedded *PushStore so the JSON-RPC dispatcher in
-// internal/a2a/server.go finds these methods on the Handler value the
-// bridge already wires up.
-
-func (s *Store) CreatePushConfig(ctx context.Context, in a2a.TaskPushNotificationConfig) (*a2a.TaskPushNotificationConfig, error) {
-	return s.Push.CreatePushConfig(ctx, in)
-}
-func (s *Store) GetPushConfig(ctx context.Context, in a2a.PushNotificationConfigParams) (*a2a.TaskPushNotificationConfig, error) {
-	return s.Push.GetPushConfig(ctx, in)
-}
-func (s *Store) ListPushConfigs(ctx context.Context, taskID string) ([]a2a.TaskPushNotificationConfig, error) {
-	return s.Push.ListPushConfigs(ctx, taskID)
-}
-func (s *Store) DeletePushConfig(ctx context.Context, in a2a.PushNotificationConfigParams) error {
-	return s.Push.DeletePushConfig(ctx, in)
 }
 
 type pendingOutgoingTask struct {
@@ -103,16 +111,22 @@ type pendingOutgoingTask struct {
 	SentAt   time.Time
 }
 
+// NewStore returns an empty store with its reply janitor running.
 func NewStore() *Store {
 	s := &Store{
-		tasks:           map[string]*a2a.Task{},
-		subscribers:     map[string][]chan a2a.StreamResponse{},
 		pendingOutgoing: map[string]*pendingOutgoingTask{},
-		Push:            NewPushStore(),
 		janitorStop:     make(chan struct{}),
 	}
 	go s.janitor()
 	return s
+}
+
+// logger returns the configured logger or the process default.
+func (s *Store) logger() *slog.Logger {
+	if s.Log != nil {
+		return s.Log
+	}
+	return slog.Default()
 }
 
 // Close stops the background janitor. Safe to call multiple times.
@@ -120,7 +134,7 @@ func (s *Store) Close() {
 	s.closeOnce.Do(func() { close(s.janitorStop) })
 }
 
-// janitor periodically evicts terminal tasks older than terminalTaskTTL.
+// janitor periodically reaps delivered outgoing-reply entries.
 func (s *Store) janitor() {
 	t := time.NewTicker(janitorInterval)
 	defer t.Stop()
@@ -129,60 +143,43 @@ func (s *Store) janitor() {
 		case <-s.janitorStop:
 			return
 		case <-t.C:
-			s.evictTerminal(time.Now())
+			s.evictExpiredReplies(time.Now())
 		}
 	}
 }
 
-// evictTerminal deletes tasks that reached a terminal state more than
-// terminalTaskTTL ago and cascades the delete to their push configs.
-// Non-terminal tasks are never evicted — they may still receive messages.
-// Returns the number of evicted tasks.
-func (s *Store) evictTerminal(now time.Time) int {
-	cutoff := now.Add(-terminalTaskTTL)
+// evictExpiredReplies drops outgoing-reply entries delivered more than
+// replyEntryTTL ago and returns how many were dropped.
+//
+// FIX(stale-re-render): outgoing-reply notifications (MessageID "reply-…") are
+// one-shot — delivered in real-time via OnIncoming + injected by the wake hook.
+// The bot never complete_task's its OWN outgoing task IDs, so CompleteTask's
+// by-taskID drop never reaches them and they re-rendered on every wake. Evict
+// by IDENTITY (MessageID prefix; `kind` is stripped on-disk) once past the
+// delivery TTL.
+func (s *Store) evictExpiredReplies(now time.Time) int {
 	s.mu.Lock()
-	var evicted []string
-	for id, t := range s.tasks {
-		if isTerminal(t.Status.State) && !t.Status.Timestamp.IsZero() && t.Status.Timestamp.Before(cutoff) {
-			delete(s.tasks, id)
-			evicted = append(evicted, id)
-		}
+	defer s.mu.Unlock()
+	if len(s.inbox) == 0 {
+		return 0
 	}
-	// FIX(stale-re-render): outgoing-reply notifications (MessageID "reply-…") are
-	// one-shot — delivered in real-time via OnIncoming + injected by the wake hook.
-	// The bot never complete_task's its OWN outgoing task IDs, so CompleteTask's
-	// by-taskID drop never reaches them and they re-rendered on every wake. Evict
-	// by IDENTITY (MessageID prefix; `kind` is stripped on-disk) once past the
-	// delivery TTL.
-	if len(s.inbox) > 0 {
-		replyCutoff := now.Add(-2 * time.Minute)
-		kept := s.inbox[:0]
-		for i := range s.inbox {
-			m := &s.inbox[i]
-			if strings.HasPrefix(m.MessageID, "reply-") {
-				if ts, ok := m.Metadata["ts"].(string); ok {
-					if when, err := time.Parse(time.RFC3339, ts); err == nil && when.Before(replyCutoff) {
-						continue // delivered + aged out → drop
-					}
-				}
+	cutoff := now.Add(-replyEntryTTL)
+	kept := s.inbox[:0]
+	for i := range s.inbox {
+		e := &s.inbox[i]
+		if strings.HasPrefix(e.MessageID, replyMessageIDPrefix) && e.TS != "" {
+			if when, err := time.Parse(time.RFC3339, e.TS); err == nil && when.Before(cutoff) {
+				continue // delivered + aged out → drop
 			}
-			kept = append(kept, *m)
 		}
-		if len(kept) != len(s.inbox) {
-			s.inbox = kept
-			s.persistInboxLocked()
-		}
+		kept = append(kept, *e)
 	}
-	s.mu.Unlock()
-	for _, id := range evicted {
-		// Empty PushConfigID = delete all webhooks for the task. The
-		// ErrTaskNotFound case (no configs registered) is expected.
-		_ = s.Push.DeletePushConfig(context.Background(), a2a.PushNotificationConfigParams{TaskID: id})
+	dropped := len(s.inbox) - len(kept)
+	if dropped > 0 {
+		s.inbox = kept
+		s.persistInboxLocked()
 	}
-	if len(evicted) > 0 {
-		s.logger().Info("evicted terminal tasks", "count", len(evicted), "ttl", terminalTaskTTL)
-	}
-	return len(evicted)
+	return dropped
 }
 
 // TrackOutgoing registers a task initiated by this agent for background polling.
@@ -195,69 +192,88 @@ func (s *Store) TrackOutgoing(taskID, peerURL, peerName, question string) {
 	}
 }
 
-// IngestOutgoingTerminal is the SSE-fast-path equivalent of PollOutgoing.
-// Bridges open a SubscribeToTask SSE stream to each peer right after
-// TrackOutgoing; when an a2a.SubscribeToTask event arrives with a
-// terminal state, the bridge passes the resolved Task here so the inbox
-// gets the reply with sub-second latency instead of waiting for the next
-// 5-second polling tick.
+// IngestOutgoingTerminal is the fast-path equivalent of PollOutgoing. The
+// bridge opens a SubscribeToTask stream to the peer right after TrackOutgoing
+// (or already holds a terminal task from a blocking send); the resolved Task
+// lands here so the inbox gets the reply with sub-second latency instead of
+// waiting for the next 5-second polling tick.
 //
 // Idempotent: a Task ID that has already been delivered (or never tracked)
-// is silently dropped — the polling fallback won't re-queue it.
+// is dropped — the polling fallback won't re-queue it.
 func (s *Store) IngestOutgoingTerminal(t *a2a.Task) bool {
-	if t == nil {
-		return false
-	}
-	switch t.Status.State {
-	case a2a.TaskStateCompleted, a2a.TaskStateFailed,
-		a2a.TaskStateCanceled, a2a.TaskStateRejected:
-	default:
+	if t == nil || !t.Status.State.Terminal() {
 		return false
 	}
 	s.mu.Lock()
-	p, ok := s.pendingOutgoing[t.ID]
+	p, ok := s.pendingOutgoing[string(t.ID)]
 	if !ok {
 		s.mu.Unlock()
 		return false
 	}
-	delete(s.pendingOutgoing, t.ID)
+	delete(s.pendingOutgoing, string(t.ID))
 	s.mu.Unlock()
 
-	reply := extractReplyText(t)
-	s.appendSyntheticReply(p, reply, string(t.Status.State))
+	s.appendSyntheticReply(p, extractReplyText(t), string(t.Status.State))
 	return true
 }
 
 // extractReplyText pulls the textual reply out of the peer's terminal
 // task — first looking at any artifacts, then falling back to status.message.
-// Shared between the polling and the SSE paths.
+// Shared between the polling and the subscription paths.
 func extractReplyText(t *a2a.Task) string {
-	reply := ""
+	var b strings.Builder
 	for _, a := range t.Artifacts {
+		if a == nil {
+			continue
+		}
 		for _, pt := range a.Parts {
-			if pt.Text == "" {
+			text := partText(pt)
+			if text == "" {
 				continue
 			}
-			if reply != "" {
-				reply += "\n"
+			if b.Len() > 0 {
+				b.WriteByte('\n')
 			}
-			reply += pt.Text
+			b.WriteString(text)
 		}
 	}
-	if reply == "" && t.Status.Message != nil {
+	if b.Len() == 0 && t.Status.Message != nil {
 		for _, pt := range t.Status.Message.Parts {
-			if pt.Text != "" {
-				reply = pt.Text
-				break
+			if text := partText(pt); text != "" {
+				return text
 			}
 		}
 	}
-	return reply
+	return b.String()
+}
+
+// partText returns the text content of a part, or "" for nil / non-text parts.
+func partText(p *a2a.Part) string {
+	if p == nil {
+		return ""
+	}
+	return p.Text()
+}
+
+// messageText concatenates the text parts of a message with newlines.
+func messageText(m *a2a.Message) string {
+	var b strings.Builder
+	for _, pt := range m.Parts {
+		text := partText(pt)
+		if text == "" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(text)
+	}
+	return b.String()
 }
 
 // appendSyntheticReply is the shared inbox-write step used by both the
-// poll loop and the SSE fast-path. Holds the lock for as little time as
-// possible and fires OnIncoming outside the critical section.
+// poll loop and the subscription fast-path. Holds the lock for as little time
+// as possible and fires OnIncoming outside the critical section.
 func (s *Store) appendSyntheticReply(p *pendingOutgoingTask, reply, state string) {
 	// FIX(empty-arrivals): a contentless completion (peer completed with no reply
 	// text — e.g. a bare a2a_complete_task ack) needs no inbox entry. The terminal
@@ -266,12 +282,14 @@ func (s *Store) appendSyntheticReply(p *pendingOutgoingTask, reply, state string
 	if strings.TrimSpace(reply) == "" {
 		return
 	}
-	synthetic := a2a.Message{
-		MessageID: "reply-" + p.TaskID,
+	synthetic := InboxEntry{
+		MessageID: replyMessageIDPrefix + p.TaskID,
 		TaskID:    p.TaskID,
-		Role:      a2a.RoleAgent,
-		Parts:     []a2a.Part{{Text: fmt.Sprintf("[ОТВЕТ от %s на твой вопрос «%s»]\n%s", p.PeerName, trimTo(p.Question, 80), reply)}},
-		Metadata:  map[string]any{"from": p.PeerName, "kind": "outgoing-reply", "state": state, "ts": time.Now().UTC().Format(time.RFC3339)},
+		From:      p.PeerName,
+		Text:      fmt.Sprintf("[ОТВЕТ от %s на твой вопрос «%s»]\n%s", p.PeerName, trimTo(p.Question, 80), reply),
+		Kind:      KindOutgoingReply,
+		State:     state,
+		TS:        time.Now().UTC().Format(time.RFC3339),
 	}
 	s.mu.Lock()
 	isNew := s.appendInboxLocked(&synthetic)
@@ -281,10 +299,10 @@ func (s *Store) appendSyntheticReply(p *pendingOutgoingTask, reply, state string
 	cb := s.OnIncoming
 	s.mu.Unlock()
 	if !isNew {
-		return // duplicate reply already queued (poll + SSE race) — don't re-inject or re-fire
+		return // duplicate reply already queued (poll + stream race) — don't re-inject or re-fire
 	}
 	if cb != nil {
-		go cb(synthetic)
+		go cb(&synthetic)
 	}
 	// Fire user hook with a flat payload so shell scripts can grep fields.
 	FireHook("on-outgoing-reply", map[string]any{
@@ -296,9 +314,9 @@ func (s *Store) appendSyntheticReply(p *pendingOutgoingTask, reply, state string
 }
 
 // PollOutgoing iterates pending outgoing tasks, queries each peer's GetTask,
-// and when COMPLETED — synthesizes an inbox message with the reply so the
+// and when terminal — synthesizes an inbox entry with the reply so the
 // UserPromptSubmit hook can inject it. Returns number of newly completed tasks.
-// This is the fallback path for when the SSE subscription dies; under
+// This is the fallback path for when the subscription dies; under
 // normal operation IngestOutgoingTerminal beats PollOutgoing to it.
 func (s *Store) PollOutgoing(fetcher func(peerURL, taskID string) (*a2a.Task, error), maxAge time.Duration) int {
 	s.mu.Lock()
@@ -318,12 +336,13 @@ func (s *Store) PollOutgoing(fetcher func(peerURL, taskID string) (*a2a.Task, er
 		}
 		t, err := fetcher(p.PeerURL, p.TaskID)
 		if err != nil {
+			s.logger().Debug("outgoing task poll failed", "task", p.TaskID, "peer", p.PeerURL, "err", err)
 			continue
 		}
-		if !isTerminal(t.Status.State) {
+		if t == nil || !t.Status.State.Terminal() {
 			continue
 		}
-		// Re-check membership under the lock: the SSE fast path
+		// Re-check membership under the lock: the fast path
 		// (IngestOutgoingTerminal) may have delivered this reply while we
 		// were doing the network fetch above. Mirroring its idempotency
 		// here prevents a double inbox entry.
@@ -334,7 +353,7 @@ func (s *Store) PollOutgoing(fetcher func(peerURL, taskID string) (*a2a.Task, er
 		}
 		delete(s.pendingOutgoing, p.TaskID)
 		s.mu.Unlock()
-		// Shared with the SSE path so OnIncoming and the
+		// Shared with the subscription path so OnIncoming and the
 		// on-outgoing-reply user hook fire on both.
 		s.appendSyntheticReply(p, extractReplyText(t), string(t.Status.State))
 		completed++
@@ -353,7 +372,39 @@ func trimTo(s string, n int) string {
 	return string(r[:n]) + "..."
 }
 
-// inboxContainsLocked reports whether a message with this id is already queued.
+// deliverIncoming queues a peer's inbound message for the host. Returns false
+// when an entry with the same MessageID is already queued; side-effects
+// (snapshot, metrics, OnIncoming, on-inbound hook) fire only for new entries.
+func (s *Store) deliverIncoming(e *InboxEntry) bool {
+	s.mu.Lock()
+	isNew := s.appendInboxLocked(e)
+	if isNew {
+		s.persistInboxLocked()
+	}
+	cb := s.OnIncoming
+	s.mu.Unlock()
+	if !isNew {
+		return false
+	}
+	metrics.IncMessagesReceived()
+	if cb != nil {
+		// The callback gets its own copy; the caller keeps e.
+		entry := *e
+		go cb(&entry)
+	}
+	// Surface inbound messages to the user's hook directory so external
+	// integrations (desktop notifications, Slack relay, audit log) get a
+	// turn. The hook's payload mirrors the synthetic-reply shape so
+	// scripts can be uniform across both events.
+	FireHook("on-inbound", map[string]any{
+		"taskId": e.TaskID,
+		"from":   e.From,
+		"text":   e.Text,
+	})
+	return true
+}
+
+// inboxContainsLocked reports whether an entry with this id is already queued.
 // Must be called with s.mu held.
 func (s *Store) inboxContainsLocked(id string) bool {
 	if id == "" {
@@ -367,19 +418,19 @@ func (s *Store) inboxContainsLocked(id string) bool {
 	return false
 }
 
-// appendInboxLocked adds a message to the inbox with effectively-once semantics
+// appendInboxLocked adds an entry to the inbox with effectively-once semantics
 // (dedup by MessageID — a redelivery is dropped) and a soft cap (oldest dropped
-// past inboxSoftCap). Returns true if the message was newly queued, false if it
+// past inboxSoftCap). Returns true if the entry was newly queued, false if it
 // was a duplicate — callers use that to skip re-firing side-effects (hook,
 // responder, metrics). Must be called with s.mu held.
-func (s *Store) appendInboxLocked(m *a2a.Message) bool {
-	if s.inboxContainsLocked(m.MessageID) {
+func (s *Store) appendInboxLocked(e *InboxEntry) bool {
+	if s.inboxContainsLocked(e.MessageID) {
 		return false
 	}
-	s.inbox = append(s.inbox, *m)
+	s.inbox = append(s.inbox, *e)
 	if over := len(s.inbox) - inboxSoftCap; over > 0 {
 		s.logger().Warn("inbox soft-cap exceeded, dropping oldest", "cap", inboxSoftCap, "dropped", over)
-		s.inbox = append([]a2a.Message(nil), s.inbox[over:]...)
+		s.inbox = append([]InboxEntry(nil), s.inbox[over:]...)
 	}
 	return true
 }
@@ -388,8 +439,8 @@ func (s *Store) appendInboxLocked(m *a2a.Message) bool {
 // making delivery durable across a bridge restart: messages that arrived but
 // were never drained survive a bounce instead of being lost. Call once at
 // startup, after InboxPath is set. The snapshot is the flat hook-facing
-// projection (persistInboxLocked), so reconstructed messages carry
-// id/task/context/from/text — the fields the drain path + host actually use.
+// projection (persistInboxLocked), so restored entries carry
+// id/task/context/from/text/ts — the fields the drain path + host actually use.
 // Missing/unreadable/empty snapshot = a normal fresh start (no-op).
 func (s *Store) LoadInbox() {
 	s.mu.Lock()
@@ -399,39 +450,29 @@ func (s *Store) LoadInbox() {
 	}
 	b, err := os.ReadFile(s.InboxPath)
 	if err != nil {
-		return // no snapshot yet — fresh bridge
+		if !os.IsNotExist(err) {
+			s.logger().Warn("inbox snapshot read failed", "path", s.InboxPath, "err", err)
+		}
+		return
 	}
-	var snap []struct {
-		MessageID string `json:"messageId"`
-		TaskID    string `json:"taskId"`
-		ContextID string `json:"contextId"`
-		From      string `json:"from"`
-		Text      string `json:"text"`
-		TS        string `json:"ts"`
+	if len(b) == 0 {
+		return // the hook truncates the file after rendering it
 	}
+	var snap []snapshotEntry
 	if err := json.Unmarshal(b, &snap); err != nil {
 		s.logger().Warn("inbox snapshot load failed", "path", s.InboxPath, "err", err)
 		return
 	}
-	for _, e := range snap {
-		m := a2a.Message{
-			MessageID: e.MessageID,
-			TaskID:    e.TaskID,
-			ContextID: e.ContextID,
-			Role:      a2a.RoleUser,
-			Parts:     []a2a.Part{{Text: e.Text}},
+	for i := range snap {
+		e := InboxEntry{
+			MessageID: snap[i].MessageID,
+			TaskID:    snap[i].TaskID,
+			ContextID: snap[i].ContextID,
+			From:      snap[i].From,
+			Text:      snap[i].Text,
+			TS:        snap[i].TS,
 		}
-		meta := map[string]any{}
-		if e.From != "" {
-			meta["from"] = e.From
-		}
-		if e.TS != "" {
-			meta["ts"] = e.TS
-		}
-		if len(meta) > 0 {
-			m.Metadata = meta
-		}
-		s.appendInboxLocked(&m)
+		s.appendInboxLocked(&e)
 	}
 	metrics.SetInboxSize(len(s.inbox))
 	if len(s.inbox) > 0 {
@@ -446,45 +487,27 @@ func (s *Store) persistInboxLocked() {
 	if s.InboxPath == "" {
 		return
 	}
-	snap := make([]map[string]any, 0, len(s.inbox))
-	for _, m := range s.inbox {
-		text := ""
-		for _, p := range m.Parts {
-			if p.Text != "" {
-				if text != "" {
-					text += "\n"
-				}
-				text += p.Text
-			}
-		}
-		from := ""
-		if m.Metadata != nil {
-			if v, ok := m.Metadata["from"].(string); ok {
-				from = v
-			}
-		}
-		entry := map[string]any{
-			"messageId": m.MessageID,
-			"taskId":    m.TaskID,
-			"contextId": m.ContextID,
-			"from":      from,
-			"text":      text,
-		}
-		// The delivery timestamp lets evictTerminal age out one-shot
+	snap := make([]snapshotEntry, 0, len(s.inbox))
+	for i := range s.inbox {
+		e := &s.inbox[i]
+		// The delivery timestamp lets the janitor age out one-shot
 		// outgoing-reply records restored after a bridge restart.
-		if ts, ok := m.Metadata["ts"].(string); ok && ts != "" {
-			entry["ts"] = ts
-		}
-		snap = append(snap, entry)
+		snap = append(snap, snapshotEntry{
+			MessageID: e.MessageID,
+			TaskID:    e.TaskID,
+			ContextID: e.ContextID,
+			From:      e.From,
+			Text:      e.Text,
+			TS:        e.TS,
+		})
 	}
 	b, err := json.Marshal(snap)
 	if err != nil {
+		s.logger().Warn("inbox snapshot encode failed", "path", s.InboxPath, "err", err)
 		return
 	}
-	// 0600 — the snapshot carries full inter-agent message text; other
-	// local users have no business reading it.
 	tmp := s.InboxPath + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+	if err := os.WriteFile(tmp, b, inboxFileMode); err != nil {
 		// Skip the rename: a stale tmp from a previous failure must not
 		// be promoted over the last good snapshot.
 		s.logger().Warn("inbox snapshot write failed", "path", tmp, "err", err)
@@ -495,202 +518,10 @@ func (s *Store) persistInboxLocked() {
 	}
 }
 
-// --- a2a.Handler ---
-
-func (s *Store) SendMessage(ctx context.Context, p a2a.MessageSendParams) (*a2a.Task, *a2a.Message, error) {
-	taskID := p.Message.TaskID
-	if taskID == "" {
-		taskID = uuid.NewString()
-	}
-	ctxID := p.Message.ContextID
-	if ctxID == "" {
-		ctxID = uuid.NewString()
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	task, existed := s.tasks[taskID]
-	if existed && isTerminal(task.Status.State) {
-		// A terminal task accepts no further input — appending would only
-		// grow history and re-notify subscribers with a stale final status.
-		return nil, nil, fmt.Errorf("task %s is in terminal state %s and accepts no further messages: %w", taskID, task.Status.State, a2a.ErrTaskNotCancelable)
-	}
-	if !existed {
-		task = &a2a.Task{
-			ID:        taskID,
-			ContextID: ctxID,
-			Kind:      "task",
-			Status: a2a.TaskStatus{
-				State:     a2a.TaskStateSubmitted,
-				Timestamp: time.Now().UTC(),
-			},
-		}
-		s.tasks[taskID] = task
-	}
-	msg := p.Message
-	msg.TaskID = taskID
-	msg.ContextID = ctxID
-	if msg.MessageID == "" {
-		msg.MessageID = uuid.NewString()
-	}
-	// Effectively-once: a redelivered message (same MessageID) is not
-	// re-queued, and its side-effects (history, hook, responder, metrics)
-	// are not re-fired. The sender still gets a valid task back.
-	isNew := s.appendInboxLocked(&msg)
-	if isNew {
-		task.History = append(task.History, msg)
-		s.persistInboxLocked()
-		metrics.IncMessagesReceived()
-
-		if s.OnIncoming != nil {
-			go s.OnIncoming(msg)
-		}
-		// Surface inbound messages to the user's hook directory so external
-		// integrations (desktop notifications, Slack relay, audit log) get a
-		// turn. The hook's payload mirrors the synthetic-reply shape so
-		// scripts can be uniform across both events.
-		from := ""
-		if v, ok := msg.Metadata["from"].(string); ok {
-			from = v
-		}
-		text := ""
-		for _, pt := range msg.Parts {
-			if pt.Text != "" {
-				text = pt.Text
-				break
-			}
-		}
-		FireHook("on-inbound", map[string]any{
-			"taskId": taskID,
-			"from":   from,
-			"text":   text,
-		})
-	}
-
-	s.notifyLocked(taskID, a2a.StreamResponse{
-		StatusUpdate: &a2a.TaskStatusUpdateEvent{
-			TaskID: taskID, ContextID: ctxID, Status: task.Status,
-		},
-	})
-
-	cp := *task
-	return &cp, nil, nil
-}
-
-func (s *Store) GetTask(ctx context.Context, p a2a.TaskIDParams) (*a2a.Task, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	t, ok := s.tasks[p.ID]
-	if !ok {
-		return nil, a2a.ErrTaskNotFound
-	}
-	cp := *t
-	if p.HistoryLength > 0 && len(cp.History) > p.HistoryLength {
-		cp.History = cp.History[len(cp.History)-p.HistoryLength:]
-	}
-	return &cp, nil
-}
-
-func (s *Store) CancelTask(ctx context.Context, p a2a.TaskIDParams) (*a2a.Task, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	t, ok := s.tasks[p.ID]
-	if !ok {
-		return nil, a2a.ErrTaskNotFound
-	}
-	if isTerminal(t.Status.State) {
-		return nil, errors.New("task is in terminal state")
-	}
-	t.Status = a2a.TaskStatus{State: a2a.TaskStateCanceled, Timestamp: time.Now().UTC()}
-	metrics.IncTaskFailed()
-	s.notifyLocked(t.ID, a2a.StreamResponse{
-		StatusUpdate: &a2a.TaskStatusUpdateEvent{
-			TaskID: t.ID, ContextID: t.ContextID, Status: t.Status, Final: true,
-		},
-	})
-	cp := *t
-	return &cp, nil
-}
-
-func (s *Store) ListTasks(ctx context.Context) ([]a2a.Task, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]a2a.Task, 0, len(s.tasks))
-	for _, t := range s.tasks {
-		out = append(out, *t)
-	}
-	return out, nil
-}
-
-func (s *Store) Subscribe(ctx context.Context, id string, out chan<- a2a.StreamResponse) error {
-	s.mu.Lock()
-	t, ok := s.tasks[id]
-	if !ok {
-		s.mu.Unlock()
-		return a2a.ErrTaskNotFound
-	}
-	// send current snapshot
-	snap := *t
-	if isTerminal(snap.Status.State) {
-		// No further events will ever arrive — deliver the snapshot and
-		// end the stream instead of parking a goroutine forever.
-		s.mu.Unlock()
-		select {
-		case out <- a2a.StreamResponse{Task: &snap}:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-		return nil
-	}
-	ch := make(chan a2a.StreamResponse, 8)
-	s.subscribers[id] = append(s.subscribers[id], ch)
-	s.mu.Unlock()
-
-	defer s.removeSubscriber(id, ch)
-
-	// Every send to out is ctx-guarded: if the consumer stops reading we
-	// must not block forever and leak this goroutine.
-	select {
-	case out <- a2a.StreamResponse{Task: &snap}:
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case ev, ok := <-ch:
-			if !ok {
-				return nil
-			}
-			select {
-			case out <- ev:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-			if ev.StatusUpdate != nil && ev.StatusUpdate.Final {
-				return nil
-			}
-		}
-	}
-}
-
-// StreamSend: same semantics as SendMessage, then streams until terminal.
-func (s *Store) StreamSend(ctx context.Context, p a2a.MessageSendParams, out chan<- a2a.StreamResponse) error {
-	task, _, err := s.SendMessage(ctx, p)
-	if err != nil {
-		return err
-	}
-	out <- a2a.StreamResponse{Task: task}
-	return s.Subscribe(ctx, task.ID, out)
-}
-
 // --- host-facing API (used by MCP tools) ---
 
-// DrainInbox returns and clears pending incoming messages.
-func (s *Store) DrainInbox() []a2a.Message {
+// DrainInbox returns and clears pending incoming entries.
+func (s *Store) DrainInbox() []InboxEntry {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := s.inbox
@@ -699,11 +530,11 @@ func (s *Store) DrainInbox() []a2a.Message {
 	return out
 }
 
-// PeekInbox returns without clearing.
-func (s *Store) PeekInbox() []a2a.Message {
+// PeekInbox returns pending entries without clearing genuine inbound ones.
+func (s *Store) PeekInbox() []InboxEntry {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]a2a.Message, len(s.inbox))
+	out := make([]InboxEntry, len(s.inbox))
 	copy(out, s.inbox)
 	// FIX(wake-spam): outgoing-reply notifications (MessageID "reply-…") are
 	// one-shot. A bot that PEEKs (instead of draining) would otherwise leave them
@@ -715,12 +546,12 @@ func (s *Store) PeekInbox() []a2a.Message {
 	kept := s.inbox[:0]
 	dropped := false
 	for i := range s.inbox {
-		m := &s.inbox[i]
-		if strings.HasPrefix(m.MessageID, "reply-") {
+		e := &s.inbox[i]
+		if strings.HasPrefix(e.MessageID, replyMessageIDPrefix) {
 			dropped = true
 			continue
 		}
-		kept = append(kept, *m)
+		kept = append(kept, *e)
 	}
 	if dropped {
 		s.inbox = kept
@@ -729,129 +560,28 @@ func (s *Store) PeekInbox() []a2a.Message {
 	return out
 }
 
-// CompleteTask attaches an agent reply as history + final artifact and transitions to COMPLETED.
-// It also drops any inbox entries tied to the same task so the hook-based summary stops mentioning it.
-func (s *Store) CompleteTask(taskID, replyText string) error {
+// dropTaskEntries removes every inbox entry tied to taskID so the hook-based
+// summary stops mentioning it. It reports whether any removed entry was a
+// synthetic outgoing-reply.
+func (s *Store) dropTaskEntries(taskID string) (droppedReply bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// Drop inbox entries for this task before the s.tasks lookup. A synthetic
-	// outgoing-reply carries an outgoing task id that is absent from s.tasks,
-	// so the earlier ErrTaskNotFound return skipped this drop and the entry
-	// lingered in the inbox snapshot.
-	filtered := s.inbox[:0]
+	kept := s.inbox[:0]
 	dropped := false
-	for _, m := range s.inbox {
-		if m.TaskID == taskID {
+	for i := range s.inbox {
+		e := &s.inbox[i]
+		if e.TaskID == taskID {
 			dropped = true
+			if e.isSyntheticReply() {
+				droppedReply = true
+			}
 			continue
 		}
-		filtered = append(filtered, m)
+		kept = append(kept, *e)
 	}
 	if dropped {
-		s.inbox = filtered
+		s.inbox = kept
 		s.persistInboxLocked()
 	}
-
-	t, ok := s.tasks[taskID]
-	if !ok {
-		if dropped {
-			// cleared a synthetic outgoing-reply; nothing else to complete
-			return nil
-		}
-		return a2a.ErrTaskNotFound
-	}
-	reply := a2a.Message{
-		MessageID: uuid.NewString(),
-		ContextID: t.ContextID,
-		TaskID:    t.ID,
-		Role:      a2a.RoleAgent,
-		Parts:     []a2a.Part{{Text: replyText}},
-	}
-	t.History = append(t.History, reply)
-	t.Artifacts = append(t.Artifacts, a2a.Artifact{
-		ArtifactID: uuid.NewString(),
-		Name:       "reply",
-		Parts:      []a2a.Part{{Text: replyText}},
-	})
-	t.Status = a2a.TaskStatus{
-		State:     a2a.TaskStateCompleted,
-		Message:   &reply,
-		Timestamp: time.Now().UTC(),
-	}
-	metrics.IncTaskCompleted()
-	s.notifyLocked(t.ID, a2a.StreamResponse{
-		ArtifactUpdate: &a2a.TaskArtifactUpdateEvent{
-			TaskID: t.ID, ContextID: t.ContextID,
-			Artifact:  t.Artifacts[len(t.Artifacts)-1],
-			LastChunk: true,
-		},
-	})
-	s.notifyLocked(t.ID, a2a.StreamResponse{
-		StatusUpdate: &a2a.TaskStatusUpdateEvent{
-			TaskID: t.ID, ContextID: t.ContextID, Status: t.Status, Final: true,
-		},
-	})
-	return nil
-}
-
-func (s *Store) notifyLocked(taskID string, ev a2a.StreamResponse) {
-	final := ev.StatusUpdate != nil && ev.StatusUpdate.Final
-	for _, ch := range s.subscribers[taskID] {
-		select {
-		case ch <- ev:
-		default:
-			// Buffer full. Intermediate events may be dropped under
-			// backpressure, but a terminal (Final) event must reach the
-			// subscriber: evict the oldest buffered event to make room.
-			// notifyLocked is the only sender and always runs under s.mu,
-			// so after the eviction the second send cannot fail.
-			if !final {
-				continue
-			}
-			select {
-			case <-ch:
-			default:
-			}
-			select {
-			case ch <- ev:
-			default:
-			}
-		}
-	}
-	if final {
-		// The stream is over: close every subscriber channel so consumers
-		// drain what's buffered and exit, and drop the bookkeeping entry
-		// (removeSubscriber tolerates already-removed channels).
-		for _, ch := range s.subscribers[taskID] {
-			close(ch)
-		}
-		delete(s.subscribers, taskID)
-	}
-	// Webhook delivery is fire-and-forget so we can call it while holding
-	// the lock — Notify only takes its own short lock to copy the config
-	// snapshot before doing HTTP I/O in goroutines.
-	if s.Push != nil {
-		s.Push.Notify(taskID, ev)
-	}
-}
-
-func (s *Store) removeSubscriber(taskID string, ch chan a2a.StreamResponse) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	subs := s.subscribers[taskID]
-	for i, c := range subs {
-		if c == ch {
-			s.subscribers[taskID] = append(subs[:i], subs[i+1:]...)
-			close(c)
-			return
-		}
-	}
-}
-
-func isTerminal(st a2a.TaskState) bool {
-	switch st {
-	case a2a.TaskStateCompleted, a2a.TaskStateFailed, a2a.TaskStateCanceled, a2a.TaskStateRejected:
-		return true
-	}
-	return false
+	return droppedReply
 }

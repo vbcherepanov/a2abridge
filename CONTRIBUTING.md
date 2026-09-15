@@ -30,7 +30,7 @@ go build ./cmd/a2abridge         # smoke
 - `go test ./... -race` green on macOS/Linux. Windows-specific tests
   skip via `runtime.GOOS == "windows"`.
 - `golangci-lint run` — the same config CI uses.
-- Imports go: stdlib block, then third-party, then `github.com/vbcherepanov/a2abridge/...`.
+- Imports go: stdlib block, then third-party, then `github.com/vbcherepanov/a2abridge/v4/...`.
 - No new TODO / FIXME / panic("not implemented"). If a thing isn't
   done, file an issue and pull-request the partial work behind a
   feature flag, not behind a TODO.

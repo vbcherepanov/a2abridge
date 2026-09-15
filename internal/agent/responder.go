@@ -12,17 +12,22 @@ import (
 	"strings"
 	"time"
 
-	"github.com/vbcherepanov/a2abridge/internal/a2a"
+	"github.com/a2aproject/a2a-go/v2/a2a"
 )
+
+// TaskCompleter answers a local task with the host's reply.
+type TaskCompleter interface {
+	CompleteTask(taskID, text string) error
+}
 
 // Responder spawns a headless CLI (`claude -p` or `codex exec`) to auto-answer
 // incoming A2A messages, without disturbing the user's interactive session.
 type Responder struct {
-	Mode    string // "claude" | "codex" | ""
-	Log     *slog.Logger
-	Card    a2a.AgentCard
-	Store   *Store
-	Timeout time.Duration
+	Mode      string // "claude" | "codex" | ""
+	Log       *slog.Logger
+	Card      *a2a.AgentCard
+	Completer TaskCompleter
+	Timeout   time.Duration
 
 	emptyMCP  string // path to a minimal MCP config so spawned CLI has no tools
 	codexHome string // tempdir used as CODEX_HOME for spawned codex (clean config)
@@ -30,8 +35,8 @@ type Responder struct {
 
 // NewResponder prepares an empty MCP config file and a fresh CODEX_HOME
 // so the spawned CLI is fully isolated (no a2a MCP → no ghost agents).
-func NewResponder(mode string, card a2a.AgentCard, store *Store, log *slog.Logger) (*Responder, error) {
-	r := &Responder{Mode: mode, Card: card, Store: store, Log: log, Timeout: 90 * time.Second}
+func NewResponder(mode string, card *a2a.AgentCard, completer TaskCompleter, log *slog.Logger) (*Responder, error) {
+	r := &Responder{Mode: mode, Card: card, Completer: completer, Log: log, Timeout: 90 * time.Second}
 
 	// empty MCP config for claude -p --strict-mcp-config
 	f, err := os.CreateTemp("", "a2a-empty-mcp-*.json")
@@ -89,86 +94,59 @@ func (r *Responder) Close() {
 	}
 }
 
-// isSyntheticReply reports whether msg is a synthetic outgoing-reply the
-// store injected for our own outbound task (or any other agent-authored
-// message). The responder must never answer those: spawning a headless
-// LLM run on a peer's answer burns money, produces an echo conversation
-// and then fails CompleteTask because the task lives on the peer's side.
-func isSyntheticReply(msg *a2a.Message) bool {
-	if msg.Role == a2a.RoleAgent {
-		return true
-	}
-	if msg.Metadata != nil {
-		if kind, ok := msg.Metadata["kind"].(string); ok && kind == "outgoing-reply" {
-			return true
-		}
-	}
-	return false
-}
-
-// Handle processes a single incoming message asynchronously.
-// Intended to be launched from Store.SendMessage via `go r.Handle(...)`.
-func (r *Responder) Handle(msg a2a.Message) {
-	if r.Mode == "" {
+// Handle processes a single inbox entry.
+// Intended to be attached to Store.OnIncoming, which runs it in a goroutine.
+func (r *Responder) Handle(entry *InboxEntry) {
+	if r.Mode == "" || entry == nil {
 		return
 	}
-	if isSyntheticReply(&msg) {
+	// Never answer a synthetic outgoing-reply: spawning a headless LLM run on
+	// a peer's answer burns money, produces an echo conversation and then
+	// fails CompleteTask because the task lives on the peer's side.
+	if entry.isSyntheticReply() {
+		return
+	}
+	question := entry.Text
+	if question == "" {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), r.Timeout)
 	defer cancel()
 
-	from := ""
-	if v, ok := msg.Metadata["from"].(string); ok {
-		from = v
-	}
-	question := ""
-	for _, p := range msg.Parts {
-		if p.Text != "" {
-			if question != "" {
-				question += "\n"
-			}
-			question += p.Text
-		}
-	}
-	if question == "" {
-		return
-	}
+	r.Log.Info("responder spawn", "mode", r.Mode, "task", entry.TaskID, "from", entry.From)
 
-	r.Log.Info("responder spawn", "mode", r.Mode, "task", msg.TaskID, "from", from)
-
-	prompt := r.buildPrompt(from, question)
+	prompt := r.buildPrompt(entry.From, question)
 	reply, err := r.run(ctx, prompt)
 	if err != nil {
-		r.Log.Warn("responder failed", "err", err, "task", msg.TaskID)
+		r.Log.Warn("responder failed", "err", err, "task", entry.TaskID)
 		FireHook("on-error", map[string]any{
-			"taskId": msg.TaskID,
-			"from":   from,
+			"taskId": entry.TaskID,
+			"from":   entry.From,
 			"error":  err.Error(),
 		})
 		return
 	}
 	reply = strings.TrimSpace(reply)
 	if reply == "" {
-		r.Log.Warn("responder empty reply", "task", msg.TaskID)
+		r.Log.Warn("responder empty reply", "task", entry.TaskID)
 		return
 	}
-	if err := r.Store.CompleteTask(msg.TaskID, reply); err != nil {
-		r.Log.Warn("responder complete failed", "err", err, "task", msg.TaskID)
+	if err := r.Completer.CompleteTask(entry.TaskID, reply); err != nil {
+		r.Log.Warn("responder complete failed", "err", err, "task", entry.TaskID)
 		FireHook("on-error", map[string]any{
-			"taskId": msg.TaskID,
-			"from":   from,
+			"taskId": entry.TaskID,
+			"from":   entry.From,
 			"error":  err.Error(),
 		})
 		return
 	}
-	r.Log.Info("responder answered", "task", msg.TaskID, "len", len(reply))
+	r.Log.Info("responder answered", "task", entry.TaskID, "len", len(reply))
 }
 
 func (r *Responder) buildPrompt(from, question string) string {
 	names := make([]string, 0, len(r.Card.Skills))
-	for _, sk := range r.Card.Skills {
-		names = append(names, sk.ID)
+	for i := range r.Card.Skills {
+		names = append(names, r.Card.Skills[i].ID)
 	}
 	if len(names) > 10 {
 		names = names[:10]

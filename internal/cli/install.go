@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/vbcherepanov/a2abridge/internal/assets"
-	"github.com/vbcherepanov/a2abridge/internal/ideconfig"
+	"github.com/vbcherepanov/a2abridge/v4/internal/assets"
+	"github.com/vbcherepanov/a2abridge/v4/internal/ideconfig"
 )
 
 func init() {
@@ -38,7 +38,7 @@ func RunInstall(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	apply := fs.Bool("apply", false, "actually write the configs (default is dry-run)")
 	dryRun := fs.Bool("dry-run", false, "force dry-run even if --apply is set")
-	ideFlag := fs.String("ide", "auto", "comma-separated IDE list (auto|claude-code,codex,cursor,cline,continue,gemini)")
+	ideFlag := fs.String("ide", "auto", "comma-separated IDE list (auto|claude-code,codex,cursor,cline,continue,gemini,antigravity)")
 	binary := fs.String("binary", "", "absolute path to the a2abridge binary (default: this executable)")
 	directory := fs.String("directory", "http://127.0.0.1:7777", "directory URL written into each config")
 	fs.Usage = func() {

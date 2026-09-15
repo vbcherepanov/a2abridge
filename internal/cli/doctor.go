@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/vbcherepanov/a2abridge/internal/buildinfo"
-	"github.com/vbcherepanov/a2abridge/internal/ideconfig"
+	"github.com/vbcherepanov/a2abridge/v4/internal/buildinfo"
+	"github.com/vbcherepanov/a2abridge/v4/internal/ideconfig"
 )
 
 func init() {
@@ -128,6 +128,9 @@ func checkIDEs() []checkResult {
 			continue
 		}
 		res := w.Write(spec, true) // dry-run
+		if res.Path != "" {
+			path = res.Path
+		}
 		switch {
 		case res.Error != nil && errors.Is(res.Error, ideconfig.ErrIDENotInstalled):
 			out = append(out, checkResult{

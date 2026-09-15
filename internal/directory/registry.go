@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/vbcherepanov/a2abridge/internal/metrics"
+	"github.com/vbcherepanov/a2abridge/v4/internal/metrics"
 )
 
 type Entry struct {

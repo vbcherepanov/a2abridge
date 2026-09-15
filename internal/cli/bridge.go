@@ -17,15 +17,33 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/a2aproject/a2a-go/v2/a2a"
+	"github.com/a2aproject/a2a-go/v2/a2asrv/push"
 	"github.com/google/uuid"
 	"github.com/mark3labs/mcp-go/server"
 
-	"github.com/vbcherepanov/a2abridge/internal/a2a"
-	"github.com/vbcherepanov/a2abridge/internal/agent"
-	"github.com/vbcherepanov/a2abridge/internal/buildinfo"
-	"github.com/vbcherepanov/a2abridge/internal/mdns"
-	"github.com/vbcherepanov/a2abridge/internal/security"
+	"github.com/vbcherepanov/a2abridge/v4/internal/agent"
+	"github.com/vbcherepanov/a2abridge/v4/internal/buildinfo"
+	"github.com/vbcherepanov/a2abridge/v4/internal/mdns"
+	"github.com/vbcherepanov/a2abridge/v4/internal/security"
 )
+
+// Bridge timing knobs.
+const (
+	outgoingPollInterval       = 5 * time.Second
+	outgoingPollRequestTimeout = 4 * time.Second
+	outgoingMaxAge             = 10 * time.Minute
+	shutdownTimeout            = 3 * time.Second
+
+	// readHeaderTimeout and requestReadTimeout bound reading one request.
+	// net/http clears the read deadline once the body is consumed, so SSE
+	// responses stay open past it.
+	readHeaderTimeout  = 10 * time.Second
+	requestReadTimeout = time.Minute
+)
+
+// providerURL is advertised in the Agent Card's provider block.
+const providerURL = "https://github.com/vbcherepanov/a2abridge"
 
 // RunBridge runs the per-agent bridge: A2A HTTP server + MCP stdio server.
 func RunBridge(args []string, _, stderr io.Writer) int {
@@ -105,9 +123,18 @@ func RunBridge(args []string, _, stderr io.Writer) int {
 	selfURL := fmt.Sprintf("%s://%s:%d", scheme, *advertiseHost, port)
 
 	store := agent.NewStore()
+	store.Log = log
+	defer store.Close()
 	store.InboxPath = filepath.Join(resolvedStateDir, "inbox.json")
 	store.LoadInbox() // durable inbox: restore messages that arrived (and weren't drained) before a restart
-	cwd, _ := os.Getwd()
+	executor := agent.NewExecutor(store, log)
+	pushConfigs := push.NewInMemoryStore()
+	tasks := agent.NewTTLStore(pushConfigs, log)
+	defer tasks.Close()
+	cwd, err := os.Getwd()
+	if err != nil {
+		log.Warn("working directory unknown", "err", err)
+	}
 
 	responderMode := os.Getenv("A2A_RESPONDER")
 	nudgeMode := os.Getenv("A2A_NUDGE")
@@ -119,20 +146,22 @@ func RunBridge(args []string, _, stderr io.Writer) int {
 			ID:          sk,
 			Name:        sk,
 			Description: "agent skill: " + sk,
+			Tags:        []string{sk},
 		})
 	}
-	card := a2a.AgentCard{
-		ProtocolVersion:    a2a.ProtocolVersion,
-		Name:               *name,
-		Description:        fmt.Sprintf("a2abridge agent (%s) at %s", *name, cwd),
-		URL:                selfURL,
-		PreferredTransport: "JSONRPC",
+	card := &a2a.AgentCard{
+		Name:        *name,
+		Description: fmt.Sprintf("a2abridge agent (%s) at %s", *name, cwd),
+		SupportedInterfaces: []*a2a.AgentInterface{
+			a2a.NewAgentInterface(selfURL, a2a.TransportProtocolJSONRPC),
+			a2a.NewAgentInterface(selfURL, a2a.TransportProtocolHTTPJSON),
+		},
 		Version:            buildinfo.Version,
 		Capabilities:       a2a.AgentCapabilities{Streaming: true, PushNotifications: true},
-		DefaultInputModes:  []string{"text/plain"},
-		DefaultOutputModes: []string{"text/plain"},
+		DefaultInputModes:  []string{agent.TextMediaType},
+		DefaultOutputModes: []string{agent.TextMediaType},
 		Skills:             agentSkills,
-		Provider:           &a2a.AgentProvider{Organization: "a2abridge"},
+		Provider:           &a2a.AgentProvider{Org: "a2abridge", URL: providerURL},
 	}
 	if *model != "" {
 		card.Description = card.Description + " | model=" + *model
@@ -151,7 +180,7 @@ func RunBridge(args []string, _, stderr io.Writer) int {
 	setParentDeathSignal(log)
 
 	if responderMode != "" {
-		r, rerr := agent.NewResponder(responderMode, card, store, log)
+		r, rerr := agent.NewResponder(responderMode, card, executor, log)
 		if rerr != nil {
 			log.Error("responder init", "err", rerr)
 		} else {
@@ -188,10 +217,28 @@ func RunBridge(args []string, _, stderr io.Writer) int {
 		}
 	}
 
-	a2aSrv := &a2a.Server{Card: card, Handler: store, Log: log}
+	// Outbound peer calls and webhook deliveries present the same client
+	// cert and trust roots as the server; nil in plain loopback mode.
+	clientTLS, err := fed.ClientTLSConfig()
+	if err != nil {
+		log.Error("client tls config", "err", err)
+		return 1
+	}
+	peers := agent.NewPeers(clientTLS, log)
+	// The SSRF guard matters once the bridge is reachable across machines; a
+	// loopback bridge's webhooks legitimately point at 127.0.0.1.
+	allowPrivatePush := !fed.Enabled() || os.Getenv("A2A_PUSH_ALLOW_PRIVATE") == "1"
+	pushSender := agent.NewPushSender(clientTLS, allowPrivatePush, log)
+
+	a2aHandler, err := agent.NewA2AHTTPHandler(card, executor, tasks, pushConfigs, pushSender, log)
+	if err != nil {
+		log.Error("a2a handler", "err", err)
+		return 1
+	}
 	httpSrv := &http.Server{
-		Handler:           a2aSrv.Routes(),
-		ReadHeaderTimeout: 10 * time.Second,
+		Handler:           a2aHandler,
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       requestReadTimeout,
 	}
 	if fed.Enabled() {
 		tlsCfg, terr := fed.ServerTLSConfig()
@@ -200,12 +247,6 @@ func RunBridge(args []string, _, stderr io.Writer) int {
 			return 1
 		}
 		httpSrv.TLSConfig = tlsCfg
-		// Outbound clients (peers, directory heartbeat, SSE subscribers)
-		// inherit the same trust roots + client cert through this default
-		// transport.
-		if clientCfg, cerr := fed.ClientTLSConfig(); cerr == nil && clientCfg != nil {
-			a2a.DefaultTransport = &http.Transport{TLSClientConfig: clientCfg}
-		}
 	}
 
 	go func() {
@@ -236,20 +277,19 @@ func RunBridge(args []string, _, stderr io.Writer) int {
 	}
 
 	go func() {
-		t := time.NewTicker(5 * time.Second)
+		t := time.NewTicker(outgoingPollInterval)
 		defer t.Stop()
 		fetcher := func(peerURL, taskID string) (*a2a.Task, error) {
-			c := a2a.NewClient(peerURL)
-			fctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+			fctx, cancel := context.WithTimeout(ctx, outgoingPollRequestTimeout)
 			defer cancel()
-			return c.GetTask(fctx, taskID)
+			return peers.GetTask(fctx, peerURL, a2a.TaskID(taskID))
 		}
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				if n := store.PollOutgoing(fetcher, 10*time.Minute); n > 0 {
+				if n := store.PollOutgoing(fetcher, outgoingMaxAge); n > 0 {
 					log.Info("outgoing replies injected", "count", n)
 				}
 			}
@@ -258,9 +298,14 @@ func RunBridge(args []string, _, stderr io.Writer) int {
 
 	mcpSrv := server.NewMCPServer("a2abridge", buildinfo.Version)
 	agent.RegisterTools(mcpSrv, &agent.MCPDeps{
+		Lifetime:     ctx,
 		Store:        store,
+		Executor:     executor,
+		Peers:        peers,
 		OwnCard:      card,
+		SelfURL:      selfURL,
 		DirectoryURL: *directoryURL,
+		Log:          log,
 	})
 
 	go func() {
@@ -280,9 +325,16 @@ func RunBridge(args []string, _, stderr io.Writer) int {
 	log.Info("shutting down")
 	// Do NOT delete store.InboxPath on shutdown — the snapshot must survive a
 	// bounce so LoadInbox() can restore undrained messages (durable delivery).
-	shutCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	shutCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	_ = httpSrv.Shutdown(shutCtx)
+	// Executions run detached from HTTP requests, so events may still be
+	// queued for webhooks; give them their own drain budget.
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer drainCancel()
+	if err := pushSender.Close(drainCtx); err != nil {
+		log.Warn("push notifications not fully drained", "err", err)
+	}
 	return 0
 }
 

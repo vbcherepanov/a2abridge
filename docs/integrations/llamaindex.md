@@ -27,7 +27,7 @@ requests.post(
 )
 ```
 
-The agent now answers `message/send` calls. Each call is one
+The agent now answers `SendMessage` calls. Each call is one
 `agent.chat(text)` invocation; the response is returned as a final
 `artifact` part with `MediaType: text/plain`.
 
@@ -47,7 +47,7 @@ agent = OpenAIAgent.from_tools([tool, *other_tools])
 
 ## Streaming
 
-LlamaIndex's `astream_chat` becomes `message/stream`. The
+LlamaIndex's `astream_chat` becomes `SendStreamingMessage`. The
 A2APeerTool surfaces each chunk as a `StreamingResponse` from the tool
 call.
 

@@ -21,7 +21,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/vbcherepanov/a2abridge/internal/buildinfo"
+	"github.com/vbcherepanov/a2abridge/v4/internal/buildinfo"
 )
 
 const defaultRepo = "vbcherepanov/a2abridge"

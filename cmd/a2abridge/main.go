@@ -11,7 +11,7 @@ package main
 import (
 	"os"
 
-	"github.com/vbcherepanov/a2abridge/internal/cli"
+	"github.com/vbcherepanov/a2abridge/v4/internal/cli"
 )
 
 func main() {
