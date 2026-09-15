@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -274,6 +275,9 @@ func TestEvictTerminalTasks(t *testing.T) {
 // TestPersistInboxFileMode — the snapshot carries inter-agent message
 // text, so it must not be world-readable.
 func TestPersistInboxFileMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits not applicable on Windows")
+	}
 	s := NewStore()
 	defer s.Close()
 	s.InboxPath = filepath.Join(t.TempDir(), "inbox.json")

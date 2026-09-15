@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -15,6 +16,7 @@ import (
 func TestContinueDetectionAndUninstall(t *testing.T) {
 	tmpHome := t.TempDir()
 	t.Setenv("HOME", tmpHome)
+	t.Setenv("USERPROFILE", tmpHome)
 	if err := os.MkdirAll(filepath.Join(tmpHome, ".continue"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -46,6 +48,9 @@ func TestContinueDetectionAndUninstall(t *testing.T) {
 // config keeps its file mode and that brand-new configs default to 0600
 // (they may hold tokens).
 func TestWriteJSONObjectPreservesPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits not applicable on Windows")
+	}
 	dir := t.TempDir()
 
 	existing := filepath.Join(dir, "settings.json")
@@ -117,6 +122,7 @@ func TestReadJSONObjectKeepsBigIntegers(t *testing.T) {
 func TestClaudeWritesMCPToClaudeJSON(t *testing.T) {
 	tmpHome := t.TempDir()
 	t.Setenv("HOME", tmpHome)
+	t.Setenv("USERPROFILE", tmpHome)
 	if err := os.MkdirAll(filepath.Join(tmpHome, ".claude"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -168,6 +174,7 @@ func TestClaudeWritesMCPToClaudeJSON(t *testing.T) {
 func TestRemoveClaudeEntriesCleansBothFiles(t *testing.T) {
 	tmpHome := t.TempDir()
 	t.Setenv("HOME", tmpHome)
+	t.Setenv("USERPROFILE", tmpHome)
 	if err := os.MkdirAll(filepath.Join(tmpHome, ".claude"), 0o755); err != nil {
 		t.Fatal(err)
 	}

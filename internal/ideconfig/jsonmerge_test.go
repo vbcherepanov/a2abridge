@@ -43,6 +43,7 @@ func TestStripPipelineOnFixtures(t *testing.T) {
 func TestClaudeWriteDryRunInTempHome(t *testing.T) {
 	tmpHome := t.TempDir()
 	t.Setenv("HOME", tmpHome)
+	t.Setenv("USERPROFILE", tmpHome)
 	if err := os.MkdirAll(filepath.Join(tmpHome, ".claude"), 0o755); err != nil {
 		t.Fatal(err)
 	}
