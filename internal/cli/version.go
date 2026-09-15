@@ -16,11 +16,12 @@ func RunVersion(args []string, stdout, _ io.Writer) int {
 		fmt.Fprintln(stdout, "Print version, commit, build date, Go runtime and target platform.")
 		return 0
 	}
+	info := buildinfo.Get()
 	fmt.Fprintf(stdout,
 		"a2abridge %s\ncommit:    %s\nbuilt:     %s\ngo:        %s\nplatform:  %s/%s\n",
-		buildinfo.Version,
-		buildinfo.Commit,
-		buildinfo.BuildDate,
+		info.Version,
+		info.Commit,
+		info.BuildDate,
 		runtime.Version(),
 		runtime.GOOS, runtime.GOARCH,
 	)

@@ -77,7 +77,7 @@ func run() int {
 			a2a.NewAgentInterface(baseURL, a2a.TransportProtocolJSONRPC),
 			a2a.NewAgentInterface(baseURL, a2a.TransportProtocolHTTPJSON),
 		},
-		Version:            buildinfo.Version,
+		Version:            buildinfo.Get().Version,
 		Capabilities:       a2a.AgentCapabilities{Streaming: true, PushNotifications: true},
 		DefaultInputModes:  []string{agent.TextMediaType},
 		DefaultOutputModes: []string{agent.TextMediaType},

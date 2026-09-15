@@ -97,11 +97,12 @@ func RunUpdate(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	fmt.Fprintf(stdout, "current: %s\nlatest:  %s\n", buildinfo.Version, target)
+	fmt.Fprintf(stdout, "current: %s\nlatest:  %s\n", buildinfo.Get().Version, target)
 
-	// Unparseable versions ("dev" builds without ldflags) are treated as
-	// older than any release — the safe default is to allow the update.
-	if cmp, comparable := compareVersions(buildinfo.Version, target); comparable {
+	// Unparseable versions ("dev" builds with neither ldflags nor module
+	// metadata) are treated as older than any release — the safe default is
+	// to allow the update.
+	if cmp, comparable := compareVersions(buildinfo.Get().Version, target); comparable {
 		if cmp == 0 {
 			fmt.Fprintln(stdout, "already up to date")
 			return 0
@@ -109,11 +110,11 @@ func RunUpdate(args []string, stdout, stderr io.Writer) int {
 		if cmp > 0 {
 			if *want != "" {
 				fmt.Fprintf(stderr, "update: refusing to downgrade from %s to %s — install the older release manually if you really need it\n",
-					buildinfo.Version, target)
+					buildinfo.Get().Version, target)
 				return 1
 			}
 			fmt.Fprintf(stdout, "current version %s is newer than the latest release %s — nothing to do\n",
-				buildinfo.Version, target)
+				buildinfo.Get().Version, target)
 			return 0
 		}
 	}
@@ -143,7 +144,7 @@ func RunUpdate(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "update: %v\n", err)
 		return 1
 	}
-	fmt.Fprintf(stdout, "updated %s → %s\n", buildinfo.Version, target)
+	fmt.Fprintf(stdout, "updated %s → %s\n", buildinfo.Get().Version, target)
 	return 0
 }
 
@@ -370,11 +371,15 @@ type parsedVersion struct {
 	pre  string
 }
 
-// parseVersion accepts "v0.2.1", "0.3.0-rc1", "1.2" and similar. Returns
-// ok=false for strings without a numeric core (e.g. bare "dev").
+// parseVersion accepts "v0.2.1", "0.3.0-rc1", "1.2", "4.0.0+dirty" and
+// similar. Build metadata after "+" is ignored, as semver precedence requires.
+// Returns ok=false for strings without a numeric core (e.g. bare "dev").
 func parseVersion(s string) (parsedVersion, bool) {
 	var v parsedVersion
 	s = strings.TrimPrefix(strings.TrimSpace(s), "v")
+	if i := strings.IndexByte(s, '+'); i >= 0 {
+		s = s[:i]
+	}
 	if i := strings.Index(s, "-"); i >= 0 {
 		v.pre = s[i+1:]
 		s = s[:i]

@@ -284,7 +284,7 @@ func svcStatus(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	fmt.Fprintf(stdout, "service: %s\nsupervisor: %s\nstatus: %s\nbinary: %s\nversion: %s\n",
-		serviceName, supervisorName(), statusString(st), executablePath(), buildinfo.Version)
+		serviceName, supervisorName(), statusString(st), executablePath(), buildinfo.Get().Version)
 	return 0
 }
 

@@ -4,6 +4,22 @@ All notable changes to a2abridge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.0.1] — 2026-09-15
+
+### Fixed
+
+- **`go install` builds report their module version.** A binary installed
+  with `go install github.com/vbcherepanov/a2abridge/v4/cmd/a2abridge@v4.0.0`
+  carries no release ldflags and printed the stale default `3.0.0-dev`. That
+  value also went into the Agent Card and MCP server version, `doctor`,
+  `service status` and the help header, and `a2abridge update` compared
+  against it. The version now comes from release ldflags, then from the module
+  version the Go toolchain records (pseudo-versions as-is), then `dev`. Commit
+  and build date fall back to the VCS stamp (`-dirty` for a modified tree),
+  then `unknown`.
+- `a2abridge update` ignores build metadata such as `+dirty` when comparing
+  versions, so toolchain-stamped builds still compare against releases.
+
 ## [4.0.0] — 2026-09-15
 
 ### Changed (breaking)

@@ -156,7 +156,7 @@ func RunBridge(args []string, _, stderr io.Writer) int {
 			a2a.NewAgentInterface(selfURL, a2a.TransportProtocolJSONRPC),
 			a2a.NewAgentInterface(selfURL, a2a.TransportProtocolHTTPJSON),
 		},
-		Version:            buildinfo.Version,
+		Version:            buildinfo.Get().Version,
 		Capabilities:       a2a.AgentCapabilities{Streaming: true, PushNotifications: true},
 		DefaultInputModes:  []string{agent.TextMediaType},
 		DefaultOutputModes: []string{agent.TextMediaType},
@@ -296,7 +296,7 @@ func RunBridge(args []string, _, stderr io.Writer) int {
 		}
 	}()
 
-	mcpSrv := server.NewMCPServer("a2abridge", buildinfo.Version)
+	mcpSrv := server.NewMCPServer("a2abridge", buildinfo.Get().Version)
 	agent.RegisterTools(mcpSrv, &agent.MCPDeps{
 		Lifetime:     ctx,
 		Store:        store,
