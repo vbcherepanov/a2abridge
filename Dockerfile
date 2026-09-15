@@ -3,7 +3,7 @@
 # attach `a2abridge worker` to a sidecar — without dragging glibc/Alpine
 # CVEs into your stack.
 
-FROM golang:1.25-alpine AS build
+FROM golang:1.27-alpine AS build
 WORKDIR /src
 
 # Build identification — wired by .github/workflows/docker.yml from the
