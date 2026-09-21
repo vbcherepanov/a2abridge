@@ -1,6 +1,6 @@
 module github.com/vbcherepanov/a2abridge/v4
 
-go 1.25.5
+go 1.26.0
 
 require (
 	github.com/BurntSushi/toml v1.6.0
@@ -9,7 +9,7 @@ require (
 	github.com/grandcat/zeroconf v1.0.0
 	github.com/kardianos/service v1.3.0
 	github.com/mark3labs/mcp-go v1.0.0
-	golang.org/x/sys v0.45.0
+	golang.org/x/sys v0.48.0
 )
 
 require (
