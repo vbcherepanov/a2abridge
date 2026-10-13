@@ -31,7 +31,7 @@ func buildFromConsumer(t *testing.T, ldflags string) string {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
-	goMod := fmt.Sprintf("module example.com/installcheck\n\ngo 1.25.5\n\nrequire %s %s\n\nreplace %s => %s\n",
+	goMod := fmt.Sprintf("module example.com/installcheck\n\ngo 1.26.0\n\nrequire %s %s\n\nreplace %s => %s\n",
 		moduleUnderTest, requiredVersion, moduleUnderTest, filepath.ToSlash(root))
 	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(goMod), 0o600); err != nil {
 		t.Fatal(err)
