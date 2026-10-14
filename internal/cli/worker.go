@@ -102,7 +102,8 @@ func workerStart(args []string, stdout, stderr io.Writer) int {
 
 	// `new-session -d` detaches immediately. The command runs as PID 1 of
 	// the session — when it exits, tmux cleans up the session itself.
-	cmd := exec.Command("tmux", "new-session", "-d", "-s", *session, *cmdName)
+	// The session name and command come from the local user's own flags and are passed without a shell.
+	cmd := exec.Command("tmux", "new-session", "-d", "-s", *session, *cmdName) //nolint:gosec // G204: see above
 	if out, err := cmd.CombinedOutput(); err != nil {
 		fmt.Fprintf(stderr, "tmux new-session failed: %v\n%s", err, out)
 		return 1
@@ -150,7 +151,7 @@ func workerStop(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "worker not running (no tmux session %q)\n", *session)
 		return 0
 	}
-	cmd := exec.Command("tmux", "kill-session", "-t", *session)
+	cmd := exec.Command("tmux", "kill-session", "-t", *session) //nolint:gosec // G204: session name from the local user's flag, no shell
 	if out, err := cmd.CombinedOutput(); err != nil {
 		fmt.Fprintf(stderr, "tmux kill-session failed: %v\n%s", err, out)
 		return 1

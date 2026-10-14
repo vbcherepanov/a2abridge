@@ -62,9 +62,10 @@ func NewResponder(mode string, card *a2a.AgentCard, completer TaskCompleter, log
 		_ = os.Remove(r.emptyMCP)
 		return nil, err
 	}
+	// Both paths are fixed names under the user's own home and a fresh temp dir; nothing comes from a peer.
 	origHome := filepath.Join(os.Getenv("HOME"), ".codex")
-	if b, rerr := os.ReadFile(filepath.Join(origHome, "auth.json")); rerr == nil {
-		if werr := os.WriteFile(filepath.Join(home, "auth.json"), b, 0o600); werr != nil {
+	if b, rerr := os.ReadFile(filepath.Join(origHome, "auth.json")); rerr == nil { //nolint:gosec // G703: see above
+		if werr := os.WriteFile(filepath.Join(home, "auth.json"), b, 0o600); werr != nil { //nolint:gosec // G703: see above
 			log.Warn("responder: auth.json copy failed, spawned codex may be unauthenticated", "err", werr)
 		}
 	} else if !os.IsNotExist(rerr) {

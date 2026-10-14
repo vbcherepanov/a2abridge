@@ -65,16 +65,16 @@ func (r *Registry) gc() {
 	}
 }
 
-func (r *Registry) Register(url string) {
+func (r *Registry) Register(peerURL string) {
 	r.mu.Lock()
-	r.entries[url] = Entry{URL: url, LastSeen: time.Now()}
+	r.entries[peerURL] = Entry{URL: peerURL, LastSeen: time.Now()}
 	metrics.SetPeers(len(r.entries))
 	r.mu.Unlock()
 }
 
-func (r *Registry) Unregister(url string) {
+func (r *Registry) Unregister(peerURL string) {
 	r.mu.Lock()
-	delete(r.entries, url)
+	delete(r.entries, peerURL)
 	metrics.SetPeers(len(r.entries))
 	r.mu.Unlock()
 }

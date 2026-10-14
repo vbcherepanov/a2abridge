@@ -58,7 +58,7 @@ func FromEnv() FederationConfig {
 // Enabled reports whether the bridge should switch to mTLS. We require at
 // least cert+key — without those, peers can't authenticate us, and the
 // loopback-default is safer than partial-TLS.
-func (c FederationConfig) Enabled() bool {
+func (c *FederationConfig) Enabled() bool {
 	return c.CertFile != "" && c.KeyFile != ""
 }
 
@@ -66,7 +66,7 @@ func (c FederationConfig) Enabled() bool {
 // endpoint with mutual auth. The peer must present a certificate that
 // chains to one of TrustRoots, and (if PeerAllowCN is non-empty) whose CN
 // or SAN matches the allow-list.
-func (c FederationConfig) ServerTLSConfig() (*tls.Config, error) {
+func (c *FederationConfig) ServerTLSConfig() (*tls.Config, error) {
 	if !c.Enabled() {
 		return nil, errors.New("federation not enabled (A2A_TLS_CERT/A2A_TLS_KEY unset)")
 	}
@@ -125,7 +125,7 @@ func (c FederationConfig) ServerTLSConfig() (*tls.Config, error) {
 
 // ClientTLSConfig is the *tls.Config the bridge uses when contacting peers.
 // Symmetrical: we present our cert, validate theirs against trust roots.
-func (c FederationConfig) ClientTLSConfig() (*tls.Config, error) {
+func (c *FederationConfig) ClientTLSConfig() (*tls.Config, error) {
 	if !c.Enabled() {
 		return nil, nil
 	}
@@ -193,7 +193,7 @@ func splitPaths(s string) []string {
 // Returns the resolved cert/key paths so callers can echo them in `a2abridge
 // service install --federation` output.
 func GenerateEd25519Cert(dir, commonName string) (certPath, keyPath string, err error) {
-	if err = os.MkdirAll(dir, 0o700); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", "", err
 	}
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
@@ -230,7 +230,8 @@ func GenerateEd25519Cert(dir, commonName string) (certPath, keyPath string, err 
 
 	certPath = filepath.Join(dir, "cert.pem")
 	keyPath = filepath.Join(dir, "key.pem")
-	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o644); err != nil {
+	// The certificate is public: peers pin it, so it stays world-readable; the key below is 0600.
+	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o644); err != nil { //nolint:gosec // G306: public certificate
 		return "", "", err
 	}
 	keyDER, err := x509.MarshalPKCS8PrivateKey(priv)

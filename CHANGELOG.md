@@ -4,6 +4,21 @@ All notable changes to a2abridge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **a2a-go v2.6.0.** It fixes subscribing to a task that waits for input,
+  so the official A2A TCK now reports 158 passed and 5 failed (was 157 and
+  6); see `docs/conformance.md`. The remaining failures are a2a-go
+  behaviour.
+- Dependencies: `golang.org/x/net` v0.60.0 and `golang.org/x/mod` v0.41.0
+  close GO-2026-6603, 6610, 6611, 6612, 6617 and GO-2026-6179, 6180.
+  govulncheck found none of them reachable from a2abridge.
+- CI builds with the latest Go 1.26 patch release and runs golangci-lint
+  again, with and without the `tck` build tag. The 20 findings that kept
+  it out of CI are fixed or annotated with the reason.
+
 ## [4.0.2] — 2026-09-21
 
 ### Fixed

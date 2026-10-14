@@ -250,7 +250,7 @@ func installHook(stdout io.Writer, apply bool) error {
 			return fmt.Errorf("backup existing hook: %w", err)
 		}
 	}
-	if err := os.WriteFile(target, assets.HookScript(), 0o755); err != nil {
+	if err := os.WriteFile(target, assets.HookScript(), 0o755); err != nil { //nolint:gosec // G306: the IDE runs the hook, so it must be executable
 		return err
 	}
 	fmt.Fprintf(stdout, "  [write]  hook             %s\n", target)

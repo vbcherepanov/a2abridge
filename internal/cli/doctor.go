@@ -55,8 +55,11 @@ func RunDoctor(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	results := []checkResult{checkBinary(), checkDirectoryReachable(*directoryURL)}
-	results = append(results, checkIDEs()...)
+	binary, directory := checkBinary(), checkDirectoryReachable(*directoryURL)
+	ides := checkIDEs()
+	results := make([]checkResult, 0, len(ides)+4)
+	results = append(results, binary, directory)
+	results = append(results, ides...)
 	results = append(results, checkSkill(), checkHook())
 
 	worst := printResults(stdout, results)

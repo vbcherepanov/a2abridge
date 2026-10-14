@@ -92,7 +92,8 @@ func TestServerTLSConfigEnforcesClientCert(t *testing.T) {
 
 	// Without a cert: connection must fail.
 	bareClient := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
-	if _, err := bareClient.Get(srv.URL); err == nil {
+	if resp, err := bareClient.Get(srv.URL); err == nil {
+		resp.Body.Close()
 		t.Error("anonymous TLS request unexpectedly succeeded")
 	}
 
@@ -195,7 +196,8 @@ func TestPeerAllowListBlocksUnlistedCN(t *testing.T) {
 		RootCAs: tlsCfg.ClientCAs,
 	}
 	client := &http.Client{Transport: &http.Transport{TLSClientConfig: clientCfg}}
-	if _, err := client.Get(srv.URL); err == nil {
+	if resp, err := client.Get(srv.URL); err == nil {
+		resp.Body.Close()
 		t.Error("expected allow-list to reject rogue-client, got nil error")
 	}
 }

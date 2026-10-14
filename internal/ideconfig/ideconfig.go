@@ -160,7 +160,8 @@ func backupFile(src string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(dst, data, info.Mode().Perm()); err != nil {
+	// dst is the IDE config path this package resolved itself, plus a timestamp suffix.
+	if err := os.WriteFile(dst, data, info.Mode().Perm()); err != nil { //nolint:gosec // G703: see above
 		return "", err
 	}
 	return dst, nil

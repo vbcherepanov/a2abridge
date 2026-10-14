@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -432,7 +433,7 @@ func parentCommand(ppid int) string {
 	if _, err := exec.LookPath("ps"); err != nil {
 		return ""
 	}
-	out, err := exec.Command("ps", "-o", "comm=", "-p", fmt.Sprint(ppid)).Output()
+	out, err := exec.Command("ps", "-o", "comm=", "-p", strconv.Itoa(ppid)).Output() //nolint:gosec // G204: fixed binary, the only argument is an integer PID
 	if err != nil {
 		return ""
 	}
@@ -447,7 +448,7 @@ func parentTTY(ppid int) string {
 	if _, err := exec.LookPath("ps"); err != nil {
 		return ""
 	}
-	out, err := exec.Command("ps", "-o", "tty=", "-p", fmt.Sprint(ppid)).Output()
+	out, err := exec.Command("ps", "-o", "tty=", "-p", strconv.Itoa(ppid)).Output() //nolint:gosec // G204: fixed binary, the only argument is an integer PID
 	if err != nil {
 		return ""
 	}

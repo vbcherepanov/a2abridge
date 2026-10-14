@@ -17,7 +17,7 @@ Closes #
 
 - [ ] `go vet ./...` passes
 - [ ] `go test ./... -race -count=1` passes locally
-- [ ] `golangci-lint run` passes locally (or it was already failing on `main`)
+- [ ] `golangci-lint run` passes locally
 - [ ] `CHANGELOG.md` updated under the right `[unreleased]` / version header
 - [ ] README / `--help` output updated if user-visible behaviour changed
 - [ ] No new `TODO` / `FIXME` / `panic("not implemented")` introduced

@@ -102,7 +102,7 @@ func RunUpdate(args []string, stdout, stderr io.Writer) int {
 	// Unparseable versions ("dev" builds with neither ldflags nor module
 	// metadata) are treated as older than any release — the safe default is
 	// to allow the update.
-	if cmp, comparable := compareVersions(buildinfo.Get().Version, target); comparable {
+	if cmp, ok := compareVersions(buildinfo.Get().Version, target); ok {
 		if cmp == 0 {
 			fmt.Fprintln(stdout, "already up to date")
 			return 0
@@ -402,11 +402,11 @@ func parseVersion(s string) (parsedVersion, bool) {
 }
 
 // compareVersions compares two version strings, returning -1/0/+1 like
-// strings.Compare. comparable=false means at least one side has no numeric
+// strings.Compare. ok=false means at least one side has no numeric
 // core (e.g. a "dev" build) and no ordering can be established. A release
 // sorts above any prerelease of the same core ("0.3.0-dev" < "0.3.0");
 // two prereleases of the same core are ordered lexically.
-func compareVersions(a, b string) (cmp int, comparable bool) {
+func compareVersions(a, b string) (cmp int, ok bool) {
 	av, aok := parseVersion(a)
 	bv, bok := parseVersion(b)
 	if !aok || !bok {
