@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
@@ -45,10 +46,17 @@ func NewA2AHTTPHandler(
 	if err != nil {
 		return nil, err
 	}
+	// Only the capabilities are enforced, as WithCapabilityChecks did before
+	// a2a-go 2.7.0: a full card would also reject message parts whose media
+	// type is not in the skills' input modes.
+	enforcer, err := a2asrv.NewAgentCardEnforcer(&a2a.AgentCard{Capabilities: card.Capabilities})
+	if err != nil {
+		return nil, fmt.Errorf("agent card enforcer: %w", err)
+	}
 	handler := a2asrv.NewHandler(utcExecutor{next: executor},
 		a2asrv.WithTaskStore(tasks),
 		a2asrv.WithPushNotifications(pushConfigs, pushSender),
-		a2asrv.WithCapabilityChecks(&card.Capabilities),
+		a2asrv.WithCallInterceptors(enforcer),
 		a2asrv.WithLogger(log),
 	)
 	guard := &protocolGuard{tasks: tasks, streaming: card.Capabilities.Streaming, log: log}
