@@ -250,13 +250,55 @@ func TestMissingOrEmptyVersionRejected(t *testing.T) {
 // from the header or the request parameter.
 func TestSupportedVersionPassesThrough(t *testing.T) {
 	a := newTestAgent(t, "peer")
-	query := rawCall(t, http.MethodGet, a.url+"/tasks/nope?A2A-Version=1.0", "", nil)
-	assertRESTError(t, query, http.StatusNotFound, "TASK_NOT_FOUND")
-	for _, version := range []string{"1.0", "1.0.3"} {
+	for _, v := range []string{"1.0", "1.0.3"} {
+		query := rawCall(t, http.MethodGet, a.url+"/tasks/nope?A2A-Version="+v, "", nil)
+		assertRESTError(t, query, http.StatusNotFound, "TASK_NOT_FOUND")
+	}
+	for _, version := range []string{"1.0", "1.0.3", " 1.0 "} {
 		resp := rawCall(t, http.MethodPost, a.url+"/", version, jsonrpcRequest(t, 4, "GetTask", map[string]any{"id": "nope"}))
 		assertRPCError(t, resp, "4", -32001, "TASK_NOT_FOUND")
 		rest := rawCall(t, http.MethodGet, a.url+"/tasks/nope", version, nil)
 		assertRESTError(t, rest, http.StatusNotFound, "TASK_NOT_FOUND")
+	}
+}
+
+// TestPinProtocolVersion: an accepted version reaches a2a-go as exactly the
+// version it serves, in the header and in the request parameter.
+func TestPinProtocolVersion(t *testing.T) {
+	served := string(a2a.Version)
+	cases := []struct {
+		header, query       string
+		wantHeader, wantQry string
+	}{
+		{header: "1.0.3", wantHeader: served},
+		{header: " 1.0 ", wantHeader: served},
+		{query: "1.0.7", wantQry: served},
+		{header: "1.0.1", query: "1.0.2", wantHeader: served, wantQry: served},
+	}
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("header=%q,query=%q", tc.header, tc.query), func(t *testing.T) {
+			target := "/tasks?filter=x"
+			if tc.query != "" {
+				target += "&A2A-Version=" + tc.query
+			}
+			r := httptest.NewRequest(http.MethodGet, target, http.NoBody)
+			if tc.header != "" {
+				r.Header.Set(a2a.SvcParamVersion, tc.header)
+			}
+			if err := checkProtocolVersion(r); err != nil {
+				t.Fatalf("checkProtocolVersion: %v", err)
+			}
+			pinProtocolVersion(r)
+			if got := r.Header.Get(a2a.SvcParamVersion); got != tc.wantHeader {
+				t.Errorf("header = %q, want %q", got, tc.wantHeader)
+			}
+			if got := r.URL.Query().Get(a2a.SvcParamVersion); got != tc.wantQry {
+				t.Errorf("query = %q, want %q", got, tc.wantQry)
+			}
+			if got := r.URL.Query().Get("filter"); got != "x" {
+				t.Errorf("other query parameters changed: filter = %q", got)
+			}
+		})
 	}
 }
 

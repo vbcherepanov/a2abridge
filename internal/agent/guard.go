@@ -146,6 +146,7 @@ func (g *protocolGuard) jsonrpc(next http.Handler) http.Handler {
 			g.writeJSONRPCError(w, http.StatusOK, id, versionErr)
 			return
 		}
+		pinProtocolVersion(r)
 		if id == nil || !g.streaming || env.Method != methodSubscribeToTask {
 			next.ServeHTTP(w, r)
 			return
@@ -178,6 +179,7 @@ func (g *protocolGuard) rest(next http.Handler) http.Handler {
 			g.writeRESTError(w, 0, err, "")
 			return
 		}
+		pinProtocolVersion(r)
 		if g.streaming && (r.Method == http.MethodGet || r.Method == http.MethodPost) {
 			if id, ok := subscribeTaskID(r.URL.Path); ok {
 				if err := g.checkSubscribable(r.Context(), id); err != nil {
@@ -272,6 +274,22 @@ func checkProtocolVersion(r *http.Request) error {
 		return fmt.Errorf("A2A-Version %q is not supported, this agent speaks %s: %w", v, a2a.Version, a2a.ErrVersionNotSupported)
 	}
 	return nil
+}
+
+// pinProtocolVersion rewrites an accepted A2A-Version (header and request
+// parameter) to the exact version a2a-go serves. a2a-go 2.7.0 compares the
+// version as a string, so "1.0.3" or " 1.0 " would otherwise be refused after
+// the guard has already accepted them. Call it only after checkProtocolVersion.
+func pinProtocolVersion(r *http.Request) {
+	served := string(a2a.Version)
+	if r.Header.Get(a2a.SvcParamVersion) != "" {
+		r.Header.Set(a2a.SvcParamVersion, served)
+	}
+	q := r.URL.Query()
+	if q.Has(a2a.SvcParamVersion) {
+		q.Set(a2a.SvcParamVersion, served)
+		r.URL.RawQuery = q.Encode()
+	}
 }
 
 // majorMinor normalizes "1.0" or "1.0.3" to "1.0"; anything else is invalid.

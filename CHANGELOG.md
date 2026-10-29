@@ -6,7 +6,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [4.0.3] — 2026-10-29
+
+### Fixed
+
+- **A2A-Version with a patch number works again with a2a-go v2.7.0.** The
+  guard accepts `1.0.3` or ` 1.0 ` as 1.0, but a2a-go v2.7.0 compares the
+  version as a string and answered `VersionNotSupported`. The guard now
+  passes the exact served version to the SDK, in the header and in the
+  `A2A-Version` request parameter.
+
 ### Changed
+
+- **a2a-go v2.7.0.** `WithCapabilityChecks` is deprecated; the agent now
+  installs `NewAgentCardEnforcer` through `WithCallInterceptors` with the
+  card's capabilities only, so the checks are the same as before and a
+  bad card is an error at startup instead of a panic.
 
 - **a2a-go v2.6.0.** It fixes subscribing to a task that waits for input,
   so the official A2A TCK now reports 158 passed and 5 failed (was 157 and
