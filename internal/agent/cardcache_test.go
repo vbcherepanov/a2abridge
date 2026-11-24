@@ -49,8 +49,9 @@ func TestAgentCardCachingHeaders(t *testing.T) {
 		t.Errorf("Cache-Control = %q, want max-age=300", cc)
 	}
 	etag := first.header.Get("ETag")
-	if len(etag) < 3 || !strings.HasPrefix(etag, `"`) || !strings.HasSuffix(etag, `"`) {
-		t.Fatalf("ETag = %q, want a quoted strong tag", etag)
+	opaque := strings.TrimPrefix(etag, "W/")
+	if opaque == etag || len(opaque) < 3 || !strings.HasPrefix(opaque, `"`) || !strings.HasSuffix(opaque, `"`) {
+		t.Fatalf("ETag = %q, want a weak tag W/\"...\"", etag)
 	}
 	if _, err := time.Parse(http.TimeFormat, first.header.Get("Last-Modified")); err != nil {
 		t.Errorf("Last-Modified = %q: %v", first.header.Get("Last-Modified"), err)
@@ -60,7 +61,7 @@ func TestAgentCardCachingHeaders(t *testing.T) {
 		t.Errorf("ETag changed between requests: %q vs %q", etag, again.header.Get("ETag"))
 	}
 
-	for _, match := range []string{etag, "W/" + etag, `"other", ` + etag, "*"} {
+	for _, match := range []string{etag, opaque, `"other", ` + etag, "*"} {
 		notModified := getCard(t, a.url, match)
 		if notModified.status != http.StatusNotModified || len(notModified.body) != 0 {
 			t.Errorf("If-None-Match %q = %d with %d bytes, want 304 empty", match, notModified.status, len(notModified.body))
