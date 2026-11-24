@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **a2a-go v2.9.0.** Its Agent Card handler now sets `ETag` and answers
+  `If-None-Match` itself, so a2abridge leaves both to the SDK and only adds
+  `Last-Modified` and `HEAD`. The card `ETag` is now weak (`W/"..."`) and
+  does not cover signature values; conditional requests work as before.
+- Dependencies: `mark3labs/mcp-go` v1.6.0 and `golang.org/x/sys` v0.50.0.
+- CI: `actions/checkout` v7, `actions/upload-artifact` v7 and
+  `docker/setup-qemu-action` v4.
+
 ## [4.0.3] — 2026-10-29
 
 ### Fixed
