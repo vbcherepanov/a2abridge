@@ -459,9 +459,9 @@ On the Hermes side the bridge is a peer with
 - **Outbound**, a token goes only to the peer it is configured for. A URL key
   matches that origin (scheme, host and port) and path prefix; a path-scoped
   key is not sent to a path with `..`, `.`, `//`, `\` or an encoded separator
-  such as `%2F` in it. A name key
-  matches the `name` in the Agent Card fetched from `peer_url` exactly
-  (case-sensitive), and the token goes only to that `peer_url`'s origin. When
+  such as `%2F` in it. A name key matches the `name` in the Agent Card
+  fetched from `peer_url` exactly (case-sensitive), and the token goes only
+  to that `peer_url`'s origin. When
   both match, the URL key wins. A name key trusts the name the peer chose for
   itself, so give a peer on another machine a URL key. A key without a scheme
   is a name, so write URLs with `https://`; the startup log lists every URL
@@ -493,8 +493,8 @@ On the Hermes side the bridge is a peer with
   with whitespace in it (a `#` comment must take a whole line), an unreadable
   file, a variable set together with its `_FILE` twin, or a token variable
   that is set but empty (a secret missing at deploy time) stops the bridge at
-  startup; to turn tokens off, leave the variables unset. Errors name the entry, never the token, and tokens never reach the
-  log. The bridge drops both token variables from its environment once read,
+  startup; to turn tokens off, leave the variables unset. Errors name the
+  entry, never the token, and tokens never reach the log. The bridge drops both token variables from its environment once read,
   so the responder's `claude`/`codex` and the user hooks do not inherit them.
 
 ## How the inbox flow actually works
