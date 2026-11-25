@@ -451,7 +451,13 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
-func jsonRPCGetTask(t *testing.T, c *http.Client, url, token string) *http.Response {
+// httpReply is what a test reads from a response whose body it closed.
+type httpReply struct {
+	StatusCode int
+	Header     http.Header
+}
+
+func jsonRPCGetTask(t *testing.T, c *http.Client, url, token string) httpReply {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodPost, url+"/", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"GetTask","params":{"id":"nope"}}`))
 	if err != nil {
@@ -467,17 +473,17 @@ func jsonRPCGetTask(t *testing.T, c *http.Client, url, token string) *http.Respo
 		t.Fatalf("POST %s: %v", url, err)
 	}
 	_ = resp.Body.Close()
-	return resp
+	return httpReply{StatusCode: resp.StatusCode, Header: resp.Header}
 }
 
-func get(t *testing.T, c *http.Client, url string) *http.Response {
+func get(t *testing.T, c *http.Client, url string) httpReply {
 	t.Helper()
 	resp, err := c.Get(url)
 	if err != nil {
 		t.Fatalf("GET %s: %v", url, err)
 	}
 	_ = resp.Body.Close()
-	return resp
+	return httpReply{StatusCode: resp.StatusCode, Header: resp.Header}
 }
 
 // C-B3, C-B4, C-B11: inbound tokens guard the protocol and /metrics; the card

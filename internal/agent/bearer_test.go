@@ -303,7 +303,10 @@ func TestBearerTransportRefusesPlainHTTP(t *testing.T) {
 		nameOrigin: "http://hermes.lan:80", nameToken: outTok,
 	}
 	req, _ := http.NewRequest(http.MethodPost, "http://hermes.lan/", strings.NewReader("{}"))
-	_, err := tr.RoundTrip(req)
+	resp, err := tr.RoundTrip(req)
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
 	if err == nil || !strings.Contains(err.Error(), "plain HTTP") {
 		t.Fatalf("err = %v, want a plain HTTP refusal", err)
 	}
@@ -315,6 +318,27 @@ func TestBearerTransportRefusesPlainHTTP(t *testing.T) {
 	}
 	if req.Header.Get("Authorization") != "" {
 		t.Error("RoundTrip modified the caller's request")
+	}
+
+	// On the success path the token goes on a clone: http.Client reuses the
+	// caller's request headers when it follows a redirect.
+	var sent string
+	tr = &bearerTransport{
+		next: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+			sent = r.Header.Get("Authorization")
+			return nil, errors.New("stop")
+		}),
+		tokens: mustPeerTokens(t, "http://127.0.0.1:9000="+outTok),
+	}
+	req, _ = http.NewRequest(http.MethodGet, "http://127.0.0.1:9000/", http.NoBody)
+	if resp, _ = tr.RoundTrip(req); resp != nil {
+		_ = resp.Body.Close()
+	}
+	if sent != "Bearer "+outTok {
+		t.Errorf("token not sent on a matching request: %q", sent)
+	}
+	if req.Header.Get("Authorization") != "" {
+		t.Error("RoundTrip set the token on the caller's request instead of a clone")
 	}
 }
 
@@ -340,7 +364,13 @@ func (s *syncLog) String() string {
 	return s.b.String()
 }
 
-func doReq(t *testing.T, method, url, token string) *http.Response {
+// httpReply is what a test reads from a response whose body it closed.
+type httpReply struct {
+	StatusCode int
+	Header     http.Header
+}
+
+func doReq(t *testing.T, method, url, token string) httpReply {
 	t.Helper()
 	var body *strings.Reader
 	if method == http.MethodPost {
@@ -358,7 +388,7 @@ func doReq(t *testing.T, method, url, token string) *http.Response {
 		t.Fatal(err)
 	}
 	_ = resp.Body.Close()
-	return resp
+	return httpReply{StatusCode: resp.StatusCode, Header: resp.Header}
 }
 
 // C-B3, C-B4, C-B8, C-B11: what needs a token, what stays open, and that the
