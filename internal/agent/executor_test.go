@@ -290,7 +290,7 @@ func TestRESTBindingGetTask(t *testing.T) {
 // JSON-RPC and HTTP+JSON bindings at A2A 1.0.
 func TestAgentCardServesBothInterfaces(t *testing.T) {
 	a := newTestAgent(t, "peer")
-	card, err := NewPeers(nil, discardLog()).Resolve(context.Background(), a.url)
+	card, err := NewPeers(nil, nil, discardLog()).Resolve(context.Background(), a.url)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}

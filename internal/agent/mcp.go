@@ -319,7 +319,7 @@ func RegisterTools(s *server.MCPServer, d *MCPDeps) {
 
 	s.AddTool(
 		mcp.NewTool("a2a_inbox",
-			mcp.WithDescription("Drain or peek pending messages that peers have sent to this agent. Each entry includes taskId so you can a2a_complete_task after answering."),
+			mcp.WithDescription("Drain or peek pending messages that peers have sent to this agent. Each entry includes taskId so you can a2a_complete_task after answering. `from` is what the sender claims about itself and is not verified; `authName`, when present, is the name of the bearer token the sender authenticated with."),
 			mcp.WithBoolean("peek", mcp.Description("If true, read without clearing")),
 		),
 		func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {

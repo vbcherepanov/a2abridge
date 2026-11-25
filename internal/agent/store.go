@@ -50,10 +50,14 @@ type InboxEntry struct {
 	TaskID    string `json:"taskId"`
 	ContextID string `json:"contextId"`
 	From      string `json:"from"`
-	Text      string `json:"text"`
-	Kind      string `json:"kind,omitempty"`
-	State     string `json:"state,omitempty"`
-	TS        string `json:"ts,omitempty"`
+	// AuthName is the name of the bearer token the sender authenticated
+	// with (A2A_AUTH_TOKENS). Unlike From, which the sender writes itself,
+	// the bridge verified it. Empty for an unauthenticated sender.
+	AuthName string `json:"authName,omitempty"`
+	Text     string `json:"text"`
+	Kind     string `json:"kind,omitempty"`
+	State    string `json:"state,omitempty"`
+	TS       string `json:"ts,omitempty"`
 }
 
 // isSyntheticReply reports whether the entry is a synthetic outgoing-reply
@@ -69,6 +73,7 @@ type snapshotEntry struct {
 	TaskID    string `json:"taskId"`
 	ContextID string `json:"contextId"`
 	From      string `json:"from"`
+	AuthName  string `json:"authName,omitempty"`
 	Text      string `json:"text"`
 	TS        string `json:"ts,omitempty"`
 }
@@ -469,6 +474,7 @@ func (s *Store) LoadInbox() {
 			TaskID:    snap[i].TaskID,
 			ContextID: snap[i].ContextID,
 			From:      snap[i].From,
+			AuthName:  snap[i].AuthName,
 			Text:      snap[i].Text,
 			TS:        snap[i].TS,
 		}
@@ -497,6 +503,7 @@ func (s *Store) persistInboxLocked() {
 			TaskID:    e.TaskID,
 			ContextID: e.ContextID,
 			From:      e.From,
+			AuthName:  e.AuthName,
 			Text:      e.Text,
 			TS:        e.TS,
 		})

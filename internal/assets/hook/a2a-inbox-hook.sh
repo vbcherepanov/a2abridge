@@ -61,7 +61,11 @@ for m in msgs:
     sender = m.get("from") or "unknown"
     task_id = m.get("taskId", "")
     text = (m.get("text") or "").replace("\n", " ").strip()
-    out.append(f"- **from `{sender}`** (task `{task_id}`): {text}")
+    # authName is verified by the bridge (bearer token); from is what the
+    # sender claims about itself.
+    auth = m.get("authName")
+    who = f"`{sender}` (claimed) · token `{auth}`" if auth else f"`{sender}`"
+    out.append(f"- **from {who}** (task `{task_id}`): {text}")
 out.append("")
 out.append("Process each message *before* answering the user. Reply with `a2a_complete_task`, then continue with the user's prompt.")
 print("\n".join(out))
