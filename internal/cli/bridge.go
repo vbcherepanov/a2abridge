@@ -100,6 +100,20 @@ func RunBridge(args []string, _, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "a2abridge bridge: %v\n", err)
 		return 1
 	}
+	// The responder's claude/codex children and the user hooks inherit our
+	// environment; they have no use for the tokens.
+	for _, k := range []string{"A2A_PEER_TOKENS", "A2A_AUTH_TOKENS"} {
+		if err := os.Unsetenv(k); err != nil {
+			log.Warn("unset token variable", "var", k, "err", err)
+		}
+	}
+	if authTokens != nil {
+		log.Info("bearer auth on", "names", authTokens.Count())
+	}
+	if peerTokens != nil {
+		urls, names := peerTokens.Describe()
+		log.Info("outbound bearer tokens", "url_keys", len(urls), "name_keys", len(names), "urls", urls, "names", names)
+	}
 
 	// Bind is also our singleton lock. On a fast parent restart the previous
 	// bridge may still be releasing this port for a few hundred milliseconds, so

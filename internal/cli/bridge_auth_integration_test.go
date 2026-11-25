@@ -319,9 +319,10 @@ func sendTo(t *testing.T, b *bridgeProc, peerURL string) (string, bool) {
 
 func assertNoTokenIn(t *testing.T, what, text string, tokens ...string) {
 	t.Helper()
-	for _, tok := range tokens {
+	for i, tok := range tokens {
+		// Never print the text: it can be an environment dump or a log.
 		if strings.Contains(text, tok) {
-			t.Errorf("%s contains a token: %q", what, text)
+			t.Errorf("%s contains test token #%d", what, i+1)
 		}
 	}
 }
@@ -421,18 +422,90 @@ func TestAuthOutboundNoTokenAcrossOrigins(t *testing.T) {
 		t.Fatalf("redirect was not followed; the test proves nothing")
 	}
 
-	elsewhere := newFakePeer(t, fakePeerOpts{name: "elsewhere"})
-	pointing := newFakePeer(t, fakePeerOpts{name: "hermes", ifaceURL: elsewhere.url})
-	b2 := startAuthBridge(t, t.TempDir(), "A2A_PEER_TOKENS="+pointing.url+"="+peerToken)
-	_, _ = sendTo(t, b2, pointing.url)
-	if len(elsewhere.protocolAuth()) == 0 {
-		t.Fatalf("card interface URL was not used; the test proves nothing")
-	}
-	for _, r := range elsewhere.requests() {
-		if r.Auth != "" {
-			t.Errorf("interface on another origin got Authorization on %s %s", r.Method, r.Path)
+	// A card pointing at another origin: the call is refused with a reason,
+	// for a URL key and for a name key alike.
+	for _, keyKind := range []string{"url", "name"} {
+		elsewhere := newFakePeer(t, fakePeerOpts{name: "elsewhere"})
+		pointing := newFakePeer(t, fakePeerOpts{name: "hermes", ifaceURL: elsewhere.url})
+		key := pointing.url + "=" + peerToken
+		if keyKind == "name" {
+			key = "hermes=" + peerToken
+		}
+		b2 := startAuthBridge(t, t.TempDir(), "A2A_PEER_TOKENS="+key)
+		text, isErr := sendTo(t, b2, pointing.url)
+		if !isErr || !strings.Contains(text, "another origin") {
+			t.Errorf("%s key: card on another origin gave %q, want a refusal naming another origin", keyKind, text)
+		}
+		assertNoTokenIn(t, "tool error", text, peerToken)
+		for _, r := range elsewhere.requests() {
+			if r.Auth != "" {
+				t.Errorf("%s key: interface on another origin got Authorization on %s %s", keyKind, r.Method, r.Path)
+			}
 		}
 	}
+}
+
+// Fix 2, 5, 8: tokens do not leak into child processes, the startup log
+// shows which keys are on, and the on-inbound hook sees the token's name.
+func TestAuthChildEnvAndStartupLog(t *testing.T) {
+	home := t.TempDir()
+	hooks := filepath.Join(home, ".a2abridge", "hooks")
+	if err := os.MkdirAll(hooks, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dump := filepath.Join(home, "hook-env.txt")
+	script := "#!/bin/sh\nenv > " + dump + ".tmp\nmv " + dump + ".tmp " + dump + "\n"
+	if err := os.WriteFile(filepath.Join(hooks, "on-inbound.sh"), []byte(script), 0o700); err != nil { //nolint:gosec // G306: hook must be executable
+		t.Fatal(err)
+	}
+	b := startAuthBridge(t, t.TempDir(), "HOME="+home,
+		"A2A_AUTH_TOKENS=hermes:"+inboundToken,
+		"A2A_PEER_TOKENS=https://gw.example/a2a="+peerToken+",buddy="+peerToken+"x")
+
+	log := b.logText()
+	for _, want := range []string{"https://gw.example:443/a2a", "buddy", "bearer auth on"} {
+		if !strings.Contains(log, want) {
+			t.Errorf("startup log lacks %q", want)
+		}
+	}
+	assertNoTokenIn(t, "bridge log", log, peerToken, inboundToken)
+
+	hc := bearerClient(inboundToken, nil)
+	card, err := agentcard.NewResolver(hc).Resolve(context.Background(), b.url())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := a2aclient.NewFromCard(context.Background(), card, a2aclient.WithJSONRPCTransport(hc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = client.Destroy() }()
+	msg := a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("hi"))
+	msg.Metadata = map[string]any{"from": "alice"}
+	if _, err := client.SendMessage(context.Background(), &a2a.SendMessageRequest{Message: msg, Config: &a2a.SendMessageConfig{ReturnImmediately: true}}); err != nil {
+		t.Fatal(err)
+	}
+	var env string
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if raw, err := os.ReadFile(dump); err == nil {
+			env = string(raw)
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if env == "" {
+		t.Fatal("on-inbound hook never ran")
+	}
+	if !strings.Contains(env, "A2A_EVENT_AUTH_NAME=hermes") {
+		t.Error("hook env lacks A2A_EVENT_AUTH_NAME=hermes")
+	}
+	for _, v := range []string{"A2A_AUTH_TOKENS=", "A2A_PEER_TOKENS="} {
+		if strings.Contains(env, "\n"+v) || strings.HasPrefix(env, v) {
+			t.Errorf("hook inherited %s", strings.TrimSuffix(v, "="))
+		}
+	}
+	assertNoTokenIn(t, "hook env", env, peerToken, inboundToken)
 }
 
 func bearerClient(token string, tlsCfg *tls.Config) *http.Client {

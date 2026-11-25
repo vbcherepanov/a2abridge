@@ -116,7 +116,7 @@ func (r *Responder) Handle(entry *InboxEntry) {
 
 	r.Log.Info("responder spawn", "mode", r.Mode, "task", entry.TaskID, "from", entry.From)
 
-	prompt := r.buildPrompt(entry.From, question)
+	prompt := r.buildPrompt(entry, question)
 	reply, err := r.run(ctx, prompt)
 	if err != nil {
 		r.Log.Warn("responder failed", "err", err, "task", entry.TaskID)
@@ -144,7 +144,13 @@ func (r *Responder) Handle(entry *InboxEntry) {
 	r.Log.Info("responder answered", "task", entry.TaskID, "len", len(reply))
 }
 
-func (r *Responder) buildPrompt(from, question string) string {
+func (r *Responder) buildPrompt(entry *InboxEntry, question string) string {
+	// from is what the sender claims; authName is the bearer token the bridge
+	// verified. Label both so the model does not trust the claim.
+	from := fmt.Sprintf("%q", entry.From)
+	if entry.AuthName != "" {
+		from = fmt.Sprintf("%q (имя заявлено отправителем, не проверено; отправитель проверен токеном %q)", entry.From, entry.AuthName)
+	}
 	names := make([]string, 0, len(r.Card.Skills))
 	for i := range r.Card.Skills {
 		names = append(names, r.Card.Skills[i].ID)
@@ -159,7 +165,7 @@ func (r *Responder) buildPrompt(from, question string) string {
 	return fmt.Sprintf(
 		`Ты автономный A2A-агент "%s" (skills: %s). Отвечаешь другому агенту кратко и по делу, без markdown-хедеров. Если вопрос вне твоей компетенции — одной строкой скажи об этом.
 
-Вопрос от агента "%s":
+Вопрос от агента %s:
 %s
 
 Ответ (одной порцией, без преамбул):`,

@@ -401,11 +401,15 @@ func (s *Store) deliverIncoming(e *InboxEntry) bool {
 	// integrations (desktop notifications, Slack relay, audit log) get a
 	// turn. The hook's payload mirrors the synthetic-reply shape so
 	// scripts can be uniform across both events.
-	FireHook("on-inbound", map[string]any{
+	payload := map[string]any{
 		"taskId": e.TaskID,
 		"from":   e.From,
 		"text":   e.Text,
-	})
+	}
+	if e.AuthName != "" {
+		payload["authName"] = e.AuthName
+	}
+	FireHook("on-inbound", payload)
 	return true
 }
 

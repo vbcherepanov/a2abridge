@@ -6,11 +6,17 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"path"
+	"sort"
 	"strings"
+	"sync"
+	"time"
+	"unicode"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
@@ -43,6 +49,10 @@ type urlToken struct {
 // AuthTokens is the inbound name:token list.
 type AuthTokens struct {
 	entries []authEntry
+
+	mu         sync.Mutex // guards the rejection-warning throttle
+	lastWarn   time.Time
+	suppressed int
 }
 
 type authEntry struct {
@@ -59,26 +69,52 @@ func LoadPeerTokens() (*PeerTokens, error) {
 		return nil, err
 	}
 	pt := &PeerTokens{byName: map[string]string{}}
+	seen := map[string]int{} // peer identity -> entry number
 	for i, e := range entries {
+		n := i + 1
 		key, tok, ok := strings.Cut(e, "=")
 		key, tok = strings.TrimSpace(key), strings.TrimSpace(tok)
 		if !ok || key == "" || tok == "" {
-			return nil, fmt.Errorf("%s entry %d: want peer=token, with a base URL or an agent name as peer", envName, i+1)
+			return nil, fmt.Errorf("%s entry %d: want peer=token, with a base URL or an agent name as peer", envName, n)
 		}
+		if err := checkToken(tok); err != nil {
+			return nil, fmt.Errorf("%s entry %d: %w", envName, n, err)
+		}
+		var id string
 		if !strings.Contains(key, "://") {
+			// The key is not quoted: a mixed-up entry can hold a token.
+			if strings.ContainsAny(key, ":/") {
+				return nil, fmt.Errorf("%s entry %d: a peer name cannot contain ':' or '/'; write a URL with its scheme (https://...)", envName, n)
+			}
+			id = "name " + key
 			pt.byName[key] = tok
-			continue
+		} else {
+			u, err := url.Parse(key)
+			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
+				return nil, fmt.Errorf("%s entry %d: peer is not an http(s) base URL", envName, n)
+			}
+			if u.Scheme == "http" && !isLoopbackHost(u.Hostname()) {
+				return nil, fmt.Errorf("%s entry %d: refusing to send a token over plain HTTP to %s, which is not loopback; use an https:// URL", envName, n, u.Host)
+			}
+			ut := urlToken{origin: originOf(u), path: strings.TrimRight(u.Path, "/"), token: tok}
+			id = "url " + ut.origin + ut.path
+			pt.byURL = append(pt.byURL, ut)
 		}
-		u, err := url.Parse(key)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
-			return nil, fmt.Errorf("%s entry %d: peer is not an http(s) base URL", envName, i+1)
+		if prev, dup := seen[id]; dup {
+			return nil, fmt.Errorf("%s entries %d and %d name the same peer", envName, prev, n)
 		}
-		if u.Scheme == "http" && !isLoopbackHost(u.Hostname()) {
-			return nil, fmt.Errorf("%s entry %d: refusing to send a token over plain HTTP to %s, which is not loopback; use an https:// URL", envName, i+1, u.Host)
-		}
-		pt.byURL = append(pt.byURL, urlToken{origin: originOf(u), path: strings.TrimRight(u.Path, "/"), token: tok})
+		seen[id] = n
 	}
 	return pt, nil
+}
+
+// checkToken rejects a token with whitespace in it, which is how an inline
+// "# comment" after a token shows up.
+func checkToken(tok string) error {
+	if strings.IndexFunc(tok, unicode.IsSpace) >= 0 {
+		return errors.New("the token contains whitespace; a # comment goes on a line of its own")
+	}
+	return nil
 }
 
 // LoadAuthTokens reads A2A_AUTH_TOKENS or A2A_AUTH_TOKENS_FILE. It returns
@@ -90,13 +126,23 @@ func LoadAuthTokens() (*AuthTokens, error) {
 		return nil, err
 	}
 	at := &AuthTokens{}
+	seen := map[[sha256.Size]byte]int{} // token digest -> entry number
 	for i, e := range entries {
+		n := i + 1
 		name, tok, ok := strings.Cut(e, ":")
 		name, tok = strings.TrimSpace(name), strings.TrimSpace(tok)
 		if !ok || name == "" || tok == "" {
-			return nil, fmt.Errorf("%s entry %d: want name:token", envName, i+1)
+			return nil, fmt.Errorf("%s entry %d: want name:token", envName, n)
 		}
-		at.entries = append(at.entries, authEntry{name: name, digest: sha256.Sum256([]byte(tok))})
+		if err := checkToken(tok); err != nil {
+			return nil, fmt.Errorf("%s entry %d: %w", envName, n, err)
+		}
+		digest := sha256.Sum256([]byte(tok))
+		if prev, dup := seen[digest]; dup {
+			return nil, fmt.Errorf("%s entries %d and %d share a token; each name needs its own", envName, prev, n)
+		}
+		seen[digest] = n
+		at.entries = append(at.entries, authEntry{name: name, digest: digest})
 	}
 	return at, nil
 }
@@ -106,22 +152,24 @@ func LoadAuthTokens() (*AuthTokens, error) {
 // blank lines skipped. nil, nil means neither is set.
 func readTokenEntries(envName string) ([]string, error) {
 	fileEnv := envName + "_FILE"
-	raw, path := os.Getenv(envName), os.Getenv(fileEnv)
+	raw, file := os.Getenv(envName), os.Getenv(fileEnv)
 	source := envName
 	switch {
-	case raw != "" && path != "":
+	case raw != "" && file != "":
 		return nil, fmt.Errorf("both %s and %s are set; set one of them", envName, fileEnv)
-	case path != "":
-		b, err := os.ReadFile(path) //nolint:gosec // G304: the path is the operator's own configuration
+	case file != "":
+		b, err := os.ReadFile(file) //nolint:gosec // G304: the path is the operator's own configuration
 		if err != nil {
 			// The path is not secret, but the error from a file holding
 			// tokens never quotes its content, only that it is unreadable.
-			return nil, fmt.Errorf("%s: cannot read %s: %w", fileEnv, path, errors.Unwrap(err))
+			return nil, fmt.Errorf("%s: cannot read %s: %w", fileEnv, file, errors.Unwrap(err))
 		}
 		raw, source = string(b), fileEnv
 	case raw == "":
 		return nil, nil
 	}
+	// Editors on Windows like to start a UTF-8 file with a byte order mark.
+	raw = strings.TrimPrefix(raw, "\ufeff")
 	var out []string
 	for _, line := range strings.Split(raw, "\n") {
 		if strings.HasPrefix(strings.TrimSpace(line), "#") {
@@ -157,14 +205,17 @@ func originOf(u *url.URL) string {
 	return strings.ToLower(u.Scheme) + "://" + net.JoinHostPort(strings.ToLower(u.Hostname()), port)
 }
 
-// forURL returns the URL-keyed token for u, longest path prefix first.
+// forURL returns the URL-keyed token for u, longest path prefix first. A
+// token scoped to a path is withheld from a path with dot segments, doubled
+// slashes or backslashes: the server may resolve /a2a/../evil to /evil.
 func (p *PeerTokens) forURL(u *url.URL) (string, bool) {
 	if p == nil {
 		return "", false
 	}
 	origin, best, tok := originOf(u), -1, ""
+	clean := isCleanPath(u.Path)
 	for _, e := range p.byURL {
-		if e.origin != origin || len(e.path) <= best {
+		if e.origin != origin || len(e.path) <= best || (e.path != "" && !clean) {
 			continue
 		}
 		if e.path == "" || u.Path == e.path || strings.HasPrefix(u.Path, e.path+"/") {
@@ -172,6 +223,19 @@ func (p *PeerTokens) forURL(u *url.URL) (string, bool) {
 		}
 	}
 	return tok, best >= 0
+}
+
+// isCleanPath reports whether p (decoded, so %2e%2e and %5c are already
+// .. and \) is already in canonical form, ignoring one trailing slash.
+func isCleanPath(p string) bool {
+	if strings.Contains(p, `\`) {
+		return false
+	}
+	trimmed := strings.TrimSuffix(p, "/")
+	if trimmed == "" {
+		return true
+	}
+	return path.Clean(trimmed) == trimmed
 }
 
 // forName returns the token keyed by an agent name.
@@ -213,26 +277,67 @@ func (t *bearerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	return t.next.RoundTrip(r)
 }
 
+// coversAny reports whether a call to at least one of the interfaces would
+// carry a token.
+func (t *bearerTransport) coversAny(ifaces []*a2a.AgentInterface) bool {
+	for _, iface := range ifaces {
+		u, err := url.Parse(iface.URL)
+		if err != nil {
+			continue
+		}
+		if _, ok := t.tokens.forURL(u); ok || (t.nameOrigin != "" && originOf(u) == t.nameOrigin) {
+			return true
+		}
+	}
+	return false
+}
+
 // authNameKey carries the authenticated token name from the HTTP middleware
 // to the A2A call interceptor.
 type authNameKey struct{}
 
+// rejectWarnEvery bounds the rejection warnings, so a scanner hammering
+// the port cannot flood the log.
+const rejectWarnEvery = time.Minute
+
 // requireBearer answers 401 to a request without a configured token and
 // passes the token's name on in the request context.
-func (a *AuthTokens) requireBearer(next http.Handler) http.Handler {
+func (a *AuthTokens) requireBearer(next http.Handler, log *slog.Logger) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		scheme, tok, _ := strings.Cut(r.Header.Get("Authorization"), " ")
-		name, ok := "", false
-		if strings.EqualFold(scheme, "Bearer") {
+		header := r.Header.Get("Authorization")
+		scheme, tok, _ := strings.Cut(header, " ")
+		name, ok, reason := "", false, "no Authorization header"
+		switch {
+		case header == "":
+		case !strings.EqualFold(scheme, "Bearer"):
+			reason = "not a Bearer token"
+		default:
+			reason = "unknown token"
 			name, ok = a.match(strings.TrimSpace(tok))
 		}
 		if !ok {
+			a.warnRejected(log, r, reason)
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			http.Error(w, "missing or invalid bearer token", http.StatusUnauthorized)
 			return
 		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), authNameKey{}, name)))
 	})
+}
+
+// warnRejected logs at most one rejection per rejectWarnEvery, with the
+// number it held back since the last one. It never logs the header.
+func (a *AuthTokens) warnRejected(log *slog.Logger, r *http.Request, reason string) {
+	a.mu.Lock()
+	if time.Since(a.lastWarn) < rejectWarnEvery {
+		a.suppressed++
+		a.mu.Unlock()
+		return
+	}
+	suppressed := a.suppressed
+	a.lastWarn, a.suppressed = time.Now(), 0
+	a.mu.Unlock()
+	log.Warn("bearer auth rejected", "remote", r.RemoteAddr, "path", r.URL.Path, "reason", reason, "suppressed_since_last", suppressed)
 }
 
 // match compares tok against every configured token in constant time. It
@@ -275,3 +380,20 @@ func AdvertiseBearer(card *a2a.AgentCard) {
 	}
 	card.SecurityRequirements = a2a.SecurityRequirementsOptions{{bearerSchemeName: {}}}
 }
+
+// Describe lists the configured keys, never the tokens: the URL keys as
+// origin plus path, and the name keys. It shows at startup which entries
+// became names, so "hermes.example.com=tok" (no scheme) is easy to spot.
+func (p *PeerTokens) Describe() (urls, names []string) {
+	for _, e := range p.byURL {
+		urls = append(urls, e.origin+e.path)
+	}
+	for name := range p.byName {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return urls, names
+}
+
+// Count is the number of inbound tokens.
+func (a *AuthTokens) Count() int { return len(a.entries) }

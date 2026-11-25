@@ -66,7 +66,7 @@ func NewA2AHTTPHandler(
 	)
 	protect := func(h http.Handler) http.Handler { return h }
 	if auth != nil {
-		protect = auth.requireBearer
+		protect = func(h http.Handler) http.Handler { return auth.requireBearer(h, log) }
 	}
 	guard := &protocolGuard{tasks: tasks, streaming: card.Capabilities.Streaming, log: log}
 	rest := protect(guard.rest(a2asrv.NewRESTHandler(handler)))

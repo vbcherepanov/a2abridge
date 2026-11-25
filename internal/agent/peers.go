@@ -54,18 +54,25 @@ func (p *Peers) Client(ctx context.Context, baseURL string) (*a2aclient.Client, 
 	if err != nil {
 		return nil, err
 	}
+	base, err := url.Parse(baseURL)
+	if err != nil {
+		return nil, fmt.Errorf("peer url %s: %w", baseURL, err)
+	}
 	httpClient := p.http
+	transport := p.http.Transport.(*bearerTransport)
 	// A name-keyed token goes only to the origin of the URL we were asked to
 	// call, and only when the card served there carries that name.
-	if tok, ok := p.tokens.forName(card.Name); ok {
-		u, err := url.Parse(baseURL)
-		if err != nil {
-			return nil, fmt.Errorf("peer url %s: %w", baseURL, err)
+	nameTok, nameKeyed := p.tokens.forName(card.Name)
+	if nameKeyed {
+		transport = &bearerTransport{next: p.transport, tokens: p.tokens, nameOrigin: originOf(base), nameToken: nameTok}
+		httpClient = &http.Client{Transport: transport}
+	}
+	// A card that sends the calls to another origin would quietly drop the
+	// token and get a 401 back; say why instead.
+	if _, urlKeyed := p.tokens.forURL(base); urlKeyed || nameKeyed {
+		if !transport.coversAny(card.SupportedInterfaces) {
+			return nil, fmt.Errorf("the Agent Card of %s points at another origin; the token configured for this peer is not sent there", baseURL)
 		}
-		httpClient = &http.Client{Transport: &bearerTransport{
-			next: p.transport, tokens: p.tokens,
-			nameOrigin: originOf(u), nameToken: tok,
-		}}
 	}
 	client, err := a2aclient.NewFromCard(ctx, card,
 		a2aclient.WithJSONRPCTransport(httpClient),

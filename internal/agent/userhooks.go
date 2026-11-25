@@ -24,6 +24,9 @@ import (
 //	A2A_EVENT_NAME = "on-inbound" | "on-outgoing-reply" | "on-error"
 //	A2A_EVENT_FROM = peer name (when applicable)
 //	A2A_EVENT_TASK = task id (when applicable)
+//	A2A_EVENT_AUTH_NAME = name of the bearer token the sender authenticated
+//	                      with (on-inbound, when A2A_AUTH_TOKENS is set);
+//	                      unlike A2A_EVENT_FROM, the bridge verified it
 //
 // Hooks are best-effort: errors are swallowed to keep the bridge
 // uninterruptible. Each hook is bounded by a 5-second timeout so a
@@ -100,6 +103,9 @@ func runHook(eventName string, payload any) {
 		}
 		if task, ok := fields["taskId"].(string); ok {
 			cmd.Env = append(cmd.Env, "A2A_EVENT_TASK="+task)
+		}
+		if name, ok := fields["authName"].(string); ok {
+			cmd.Env = append(cmd.Env, "A2A_EVENT_AUTH_NAME="+name)
 		}
 	}
 
