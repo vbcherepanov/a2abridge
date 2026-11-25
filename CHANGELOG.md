@@ -13,15 +13,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `A2A_PEER_TOKENS` (or `A2A_PEER_TOKENS_FILE`) sends `Authorization: Bearer`
   to the peer each token is configured for, matched by base URL or by Agent
   Card name. It never goes over plain HTTP to a host that is not loopback, and
-  never across a redirect to another host. `A2A_AUTH_TOKENS` (or
+  never across a redirect to another host; a redirect into another origin
+  that has a token of its own is refused. `A2A_AUTH_TOKENS` (or
   `A2A_AUTH_TOKENS_FILE`) takes `name:token` pairs. Without a valid token,
   protocol routes and `/metrics` answer `401` with `WWW-Authenticate: Bearer`,
   while the Agent Card and `/healthz` stay open. The card lists the bearer
   scheme, and the token's name reaches the agent as `authName` next to the
   self-reported `from`: in `a2a_inbox`, the prompt hook, the `on-inbound`
   user hook (`A2A_EVENT_AUTH_NAME`) and the `A2A_RESPONDER` prompt. With mTLS
-  on, a request needs both. A malformed configuration stops the bridge at
-  startup without printing the token, and the token variables are dropped
+  on, a request needs both. A malformed configuration, or a token variable
+  that is set but empty, stops the bridge at startup without printing the
+  token, and the token variables are dropped
   from the environment that child processes inherit.
 
 ### Fixed

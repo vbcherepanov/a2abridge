@@ -458,7 +458,8 @@ On the Hermes side the bridge is a peer with
 
 - **Outbound**, a token goes only to the peer it is configured for. A URL key
   matches that origin (scheme, host and port) and path prefix; a path-scoped
-  key is not sent to a path with `..`, `.`, `//` or `\` in it. A name key
+  key is not sent to a path with `..`, `.`, `//`, `\` or an encoded separator
+  such as `%2F` in it. A name key
   matches the `name` in the Agent Card fetched from `peer_url` exactly
   (case-sensitive), and the token goes only to that `peer_url`'s origin. When
   both match, the URL key wins. A name key trusts the name the peer chose for
@@ -467,9 +468,12 @@ On the Hermes side the bridge is a peer with
   key and name key, never the tokens.
 - A token is never sent over plain HTTP to a host that is not loopback. A URL
   key like that stops the bridge at startup, and a call that would send one
-  fails with an error that says why. A redirect to another host gets no
-  token. A peer whose Agent Card sends the calls to another origin is refused
-  with an error saying so, instead of being called without its token.
+  fails with an error that says why. A redirect to another origin never
+  carries the first origin's token, and the bridge refuses to follow a
+  redirect into another origin that has a token of its own, so no peer can
+  bounce a call to a configured peer and have it carry that peer's token.
+  A peer whose Agent Card sends the calls to another origin is refused with
+  an error saying so, instead of being called without its token.
 - **Inbound**, a request without a valid token gets `401` with
   `WWW-Authenticate: Bearer`, and the bridge logs a warning (at most one a
   minute) with the caller's address, the path and the reason. The Agent Card
@@ -485,8 +489,9 @@ On the Hermes side the bridge is a peer with
   valid token.
 - A malformed entry, a duplicate peer key, one token under two names, a token
   with whitespace in it (a `#` comment must take a whole line), an unreadable
-  file, or a variable set together with its `_FILE` twin stops the bridge at
-  startup. Errors name the entry, never the token, and tokens never reach the
+  file, a variable set together with its `_FILE` twin, or a token variable
+  that is set but empty (a secret missing at deploy time) stops the bridge at
+  startup; to turn tokens off, leave the variables unset. Errors name the entry, never the token, and tokens never reach the
   log. The bridge drops both token variables from its environment once read,
   so the responder's `claude`/`codex` and the user hooks do not inherit them.
 
