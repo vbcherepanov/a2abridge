@@ -283,18 +283,27 @@ func (t *bearerTransport) tokenFor(u *url.URL) (string, bool) {
 	return "", false
 }
 
-// client wraps the transport in an http.Client that will not follow a
-// redirect from one origin into another origin holding a token: otherwise
-// any peer could bounce our request to a configured peer and have it carry
-// that peer's token. Redirects that carry no token are followed as usual.
+// client wraps the transport in an http.Client that only follows a redirect
+// into a token the original request already carried: same origin and the
+// same token. Otherwise any peer, or an unscoped path of a gateway, could
+// bounce our request to where a token applies and have it carry that token.
+// It compares with the original request (via[0]), so a chain of redirects
+// cannot launder the token hop by hop. Redirects that carry no token are
+// followed as usual.
 func (t *bearerTransport) client() *http.Client {
 	return &http.Client{Transport: t, CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		if len(via) >= 10 { // net/http's default limit
 			return errors.New("stopped after 10 redirects")
 		}
-		from, to := originOf(via[0].URL), originOf(req.URL)
-		if _, carries := t.tokenFor(req.URL); carries && from != to {
-			return fmt.Errorf("refused to follow a redirect from %s to %s: %s has a configured bearer token", from, to, to)
+		destTok, carries := t.tokenFor(req.URL)
+		if !carries {
+			return nil
+		}
+		origTok, origCarries := t.tokenFor(via[0].URL)
+		sameOrigin := originOf(via[0].URL) == originOf(req.URL)
+		if !sameOrigin || !origCarries || subtle.ConstantTimeCompare([]byte(destTok), []byte(origTok)) != 1 {
+			return fmt.Errorf("refused to follow a redirect from %s to %s: a bearer token is configured there that the original request did not carry",
+				originOf(via[0].URL)+via[0].URL.EscapedPath(), originOf(req.URL)+req.URL.EscapedPath())
 		}
 		return nil
 	}}

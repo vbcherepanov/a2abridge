@@ -468,10 +468,12 @@ On the Hermes side the bridge is a peer with
   key and name key, never the tokens.
 - A token is never sent over plain HTTP to a host that is not loopback. A URL
   key like that stops the bridge at startup, and a call that would send one
-  fails with an error that says why. A redirect to another origin never
-  carries the first origin's token, and the bridge refuses to follow a
-  redirect into another origin that has a token of its own, so no peer can
-  bounce a call to a configured peer and have it carry that peer's token.
+  fails with an error that says why. A redirect is followed with a token only
+  when the original request already carried that same token on the same
+  origin. A redirect toward any other configured token (another peer, or
+  another path scope on the same gateway) is refused, so no peer can bounce
+  a call there and have it carry the token. A redirect to a place with no
+  token is followed and carries none.
   A peer whose Agent Card sends the calls to another origin is refused with
   an error saying so, instead of being called without its token.
 - **Inbound**, a request without a valid token gets `401` with

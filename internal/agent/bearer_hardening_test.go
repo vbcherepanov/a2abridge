@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
@@ -342,5 +344,82 @@ func TestURLKeyWithholdsEncodedSeparators(t *testing.T) {
 		if got, _ := pt.forURL(u); got != want {
 			t.Errorf("forURL(%s) = %q, want %q", raw, got, want)
 		}
+	}
+}
+
+// Codex 1, same origin: path-scoped keys share an origin, so a redirect is
+// refused whenever the destination would carry a token the original request
+// did not carry. A redirect that keeps the same token keeps working.
+func TestRedirectWithinOriginKeepsTokenScope(t *testing.T) {
+	var mu sync.Mutex
+	seen := map[string]string{} // path -> Authorization
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen[r.URL.Path] = r.Header.Get("Authorization")
+		mu.Unlock()
+		if to := r.URL.Query().Get("to"); to != "" {
+			http.Redirect(w, r, to, http.StatusTemporaryRedirect)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	authAt := func(p string) (string, bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		a, ok := seen[p]
+		return a, ok
+	}
+	post := func(keys, start string) error {
+		c := (&bearerTransport{next: http.DefaultTransport, tokens: mustPeerTokens(t, keys)}).client()
+		resp, err := c.Post(srv.URL+start, "application/json", strings.NewReader("{}"))
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		return err
+	}
+
+	// No token on /evil, redirected into the /a scope: refused.
+	if err := post(srv.URL+"/a=scoped-"+outTok, "/evil?to=/a/x"); err == nil || !strings.Contains(err.Error(), "refused to follow a redirect") {
+		t.Errorf("unscoped -> scoped: err = %v, want a refused redirect", err)
+	} else if strings.Contains(err.Error(), outTok) {
+		t.Error("the refusal leaks a token")
+	}
+	if _, ok := authAt("/a/x"); ok {
+		t.Error("scoped path was reached after a redirect from outside its scope")
+	}
+
+	// From one scope into another on the same origin: refused.
+	if err := post(srv.URL+"/a=one,"+srv.URL+"/b=two", "/a/start?to=/b/x"); err == nil || !strings.Contains(err.Error(), "refused to follow a redirect") {
+		t.Errorf("scope a -> scope b: err = %v, want a refused redirect", err)
+	}
+	if _, ok := authAt("/b/x"); ok {
+		t.Error("scope b was reached after a redirect from scope a")
+	}
+
+	// Same token on both hops: followed, with the token.
+	if err := post(srv.URL+"/a=scoped", "/a?to=/a/"); err != nil {
+		t.Errorf("/a -> /a/ on a scoped key: %v", err)
+	}
+	if a, _ := authAt("/a/"); a != "Bearer scoped" {
+		t.Errorf("/a/ after a same-scope redirect got %q", a)
+	}
+	if err := post(srv.URL+"=root", "/one?to=/two"); err != nil {
+		t.Errorf("root key redirect: %v", err)
+	}
+	if a, _ := authAt("/two"); a != "Bearer root" {
+		t.Errorf("/two after a root-key redirect got %q", a)
+	}
+
+	// Another origin holding the very same token string: still refused, the
+	// origin is part of the rule.
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			t.Error("the other origin received a token through a redirect")
+		}
+	}))
+	t.Cleanup(other.Close)
+	if err := post(srv.URL+"=same,"+other.URL+"=same", "/x?to="+other.URL+"/y"); err == nil || !strings.Contains(err.Error(), "refused to follow a redirect") {
+		t.Errorf("cross-origin, same token: err = %v, want a refused redirect", err)
 	}
 }

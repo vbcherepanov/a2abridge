@@ -13,8 +13,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `A2A_PEER_TOKENS` (or `A2A_PEER_TOKENS_FILE`) sends `Authorization: Bearer`
   to the peer each token is configured for, matched by base URL or by Agent
   Card name. It never goes over plain HTTP to a host that is not loopback, and
-  never across a redirect to another host; a redirect into another origin
-  that has a token of its own is refused. `A2A_AUTH_TOKENS` (or
+  never across a redirect to another host; a redirect toward a token the
+  original request did not carry is refused. `A2A_AUTH_TOKENS` (or
   `A2A_AUTH_TOKENS_FILE`) takes `name:token` pairs. Without a valid token,
   protocol routes and `/metrics` answer `401` with `WWW-Authenticate: Bearer`,
   while the Agent Card and `/healthz` stay open. The card lists the bearer
