@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -601,5 +602,39 @@ func TestPeerCertNamesTheLeafOfAChain(t *testing.T) {
 	task := sendImmediate(t, a.client(t), userMessage("hi"))
 	if got := a.inboxEntryFor(t, task.ID).PeerCert; got != "laptop-a" {
 		t.Errorf("PeerCert = %q, want the leaf's name laptop-a", got)
+	}
+}
+
+// When the client stops reading, mcp-go's notification queue fills up. The
+// bridge must say which message was not sent, not log it as queued.
+func TestChannelReportsEventsTheClientDoesNotTake(t *testing.T) {
+	log, buf := warnLog()
+	ch, srv := channelServer(t, log)
+	p := startStdio(t, srv, ch.StdioOptions()...)
+	p.initialize(t, "claude-code", "2025-11-25")
+
+	// Nothing reads p.lines from here: its buffer, the pipe and then
+	// mcp-go's 100-slot queue fill up.
+	for i := range 400 {
+		ch.Handle(&InboxEntry{TaskID: fmt.Sprintf("t%d", i), Text: "flood"})
+	}
+	waitFor(t, "a not-sent warning", func() bool {
+		return strings.Contains(buf.String(), "channel event not sent")
+	})
+	if !strings.Contains(buf.String(), "task=t") {
+		t.Errorf("not-sent warning should name the task:\n%s", buf.String())
+	}
+
+	// Drain, so the shared mcp-go stdio session starts the next test empty.
+	for quiet := time.After(500 * time.Millisecond); ; {
+		select {
+		case _, ok := <-p.lines:
+			if !ok {
+				return
+			}
+			quiet = time.After(500 * time.Millisecond)
+		case <-quiet:
+			return
+		}
 	}
 }

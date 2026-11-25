@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -34,9 +33,10 @@ const claudeCodeClient = "claude-code"
 type Channel struct {
 	log *slog.Logger
 	srv atomic.Pointer[server.MCPServer]
-	// ready turns true once a client has run the initialize handshake.
-	// Before that mcp-go has no session to send to and drops the event.
-	ready atomic.Bool
+	// session is the ID of the session that ran the initialize handshake.
+	// Events go to that session only; before it exists there is no one to
+	// send to.
+	session atomic.Value // string
 
 	nonClaudeOnce  sync.Once
 	modernOnce     sync.Once
@@ -56,8 +56,10 @@ func (c *Channel) ServerOptions() []server.ServerOption {
 		return nil
 	}
 	hooks := &server.Hooks{}
-	hooks.AddAfterInitialize(func(_ context.Context, _ any, req *mcp.InitializeRequest, _ *mcp.InitializeResult) {
-		c.ready.Store(true)
+	hooks.AddAfterInitialize(func(ctx context.Context, _ any, req *mcp.InitializeRequest, _ *mcp.InitializeResult) {
+		if session := server.ClientSessionFromContext(ctx); session != nil {
+			c.session.Store(session.SessionID())
+		}
 		if name := req.Params.ClientInfo.Name; name != claudeCodeClient {
 			c.nonClaudeOnce.Do(func() {
 				c.log.Warn("A2A_NUDGE=channel: MCP client is not Claude Code, so channel events will not reach it; incoming messages still wait in the inbox",
@@ -76,12 +78,6 @@ func (c *Channel) ServerOptions() []server.ServerOption {
 				c.log.Warn("A2A_NUDGE=channel: client is using MCP protocol "+v+", and Claude Code skips channel events on that revision; incoming messages still wait in the inbox",
 					"protocol", v)
 			})
-		}
-	})
-	hooks.AddOnError(func(_ context.Context, _ any, _ mcp.MCPMethod, _ any, err error) {
-		// mcp-go reports a full notification queue only through this hook.
-		if errors.Is(err, server.ErrNotificationChannelBlocked) {
-			c.log.Warn("channel event dropped: the MCP client is not reading notifications; the message stays in the inbox", "err", err)
 		}
 	})
 	return []server.ServerOption{
@@ -128,7 +124,8 @@ func (c *Channel) Handle(e *InboxEntry) {
 		return
 	}
 	srv := c.srv.Load()
-	if srv == nil || !c.ready.Load() {
+	sessionID, _ := c.session.Load().(string)
+	if srv == nil || sessionID == "" {
 		c.log.Info("channel event not sent: no MCP session has initialized yet; the message waits in the inbox", "task", e.TaskID)
 		return
 	}
@@ -147,10 +144,15 @@ func (c *Channel) Handle(e *InboxEntry) {
 	if e.PeerCert != "" {
 		meta["peer_cert"] = e.PeerCert
 	}
-	srv.SendNotificationToAllClients(channelMethod, map[string]any{
+	if err := srv.SendNotificationToSpecificClient(sessionID, channelMethod, map[string]any{
 		"content": e.Text,
 		"meta":    meta,
-	})
+	}); err != nil {
+		// A full queue (the client stopped reading) or a session that went
+		// away. Nothing is lost: the entry is still in the inbox.
+		c.log.Warn("channel event not sent; the message waits in the inbox", "task", e.TaskID, "err", err)
+		return
+	}
 	c.log.Info("channel event queued", "task", e.TaskID)
 	c.firstEventOnce.Do(func() {
 		// Claude Code never acknowledges a channel event, and its traffic is
