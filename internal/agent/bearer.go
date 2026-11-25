@@ -149,10 +149,21 @@ func LoadAuthTokens() (*AuthTokens, error) {
 
 // readTokenEntries returns the non-empty entries of envName or of the file
 // named by envName_FILE: pairs split on commas and newlines, # comments and
-// blank lines skipped. nil, nil means neither is set.
+// blank lines skipped. nil, nil means neither is set. A variable that is
+// set but empty is an error, not "off": it is what a secret missing at
+// deploy time looks like, and silently turning auth off would hide it.
 func readTokenEntries(envName string) ([]string, error) {
 	fileEnv := envName + "_FILE"
-	raw, file := os.Getenv(envName), os.Getenv(fileEnv)
+	raw, rawSet := os.LookupEnv(envName)
+	file, fileSet := os.LookupEnv(fileEnv)
+	for _, v := range []struct {
+		name, value string
+		set         bool
+	}{{envName, raw, rawSet}, {fileEnv, file, fileSet}} {
+		if v.set && strings.TrimSpace(v.value) == "" {
+			return nil, fmt.Errorf("%s is set but empty; unset it to turn bearer tokens off", v.name)
+		}
+	}
 	source := envName
 	switch {
 	case raw != "" && file != "":
@@ -213,7 +224,10 @@ func (p *PeerTokens) forURL(u *url.URL) (string, bool) {
 		return "", false
 	}
 	origin, best, tok := originOf(u), -1, ""
-	clean := isCleanPath(u.Path)
+	// Go sets RawPath only when the escaped form differs from the default
+	// encoding of Path, as with an encoded slash (%2F): a proxy that keeps it
+	// routes the request somewhere the decoded path does not say.
+	clean := isCleanPath(u.Path) && u.RawPath == ""
 	for _, e := range p.byURL {
 		if e.origin != origin || len(e.path) <= best || (e.path != "" && !clean) {
 			continue
@@ -258,11 +272,36 @@ type bearerTransport struct {
 	nameOrigin, nameToken string
 }
 
-func (t *bearerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
-	tok, ok := t.tokens.forURL(r.URL)
-	if !ok && t.nameOrigin != "" && originOf(r.URL) == t.nameOrigin {
-		tok, ok = t.nameToken, true
+// tokenFor returns the token a request to u carries, if any.
+func (t *bearerTransport) tokenFor(u *url.URL) (string, bool) {
+	if tok, ok := t.tokens.forURL(u); ok {
+		return tok, true
 	}
+	if t.nameOrigin != "" && originOf(u) == t.nameOrigin {
+		return t.nameToken, true
+	}
+	return "", false
+}
+
+// client wraps the transport in an http.Client that will not follow a
+// redirect from one origin into another origin holding a token: otherwise
+// any peer could bounce our request to a configured peer and have it carry
+// that peer's token. Redirects that carry no token are followed as usual.
+func (t *bearerTransport) client() *http.Client {
+	return &http.Client{Transport: t, CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 { // net/http's default limit
+			return errors.New("stopped after 10 redirects")
+		}
+		from, to := originOf(via[0].URL), originOf(req.URL)
+		if _, carries := t.tokenFor(req.URL); carries && from != to {
+			return fmt.Errorf("refused to follow a redirect from %s to %s: %s has a configured bearer token", from, to, to)
+		}
+		return nil
+	}}
+}
+
+func (t *bearerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	tok, ok := t.tokenFor(r.URL)
 	if !ok {
 		return t.next.RoundTrip(r)
 	}
@@ -285,7 +324,7 @@ func (t *bearerTransport) coversAny(ifaces []*a2a.AgentInterface) bool {
 		if err != nil {
 			continue
 		}
-		if _, ok := t.tokens.forURL(u); ok || (t.nameOrigin != "" && originOf(u) == t.nameOrigin) {
+		if _, ok := t.tokenFor(u); ok {
 			return true
 		}
 	}

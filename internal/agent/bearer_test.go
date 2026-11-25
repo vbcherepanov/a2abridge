@@ -28,11 +28,16 @@ const (
 	inTok  = "in-secret-77cd"
 )
 
-// clearTokenEnv makes the token variables empty for one test.
+// clearTokenEnv unsets the token variables for one test. Set-but-empty is
+// a configuration error, so they are unset, not emptied; t.Setenv first
+// registers the restore.
 func clearTokenEnv(t *testing.T) {
 	t.Helper()
 	for _, k := range []string{"A2A_PEER_TOKENS", "A2A_PEER_TOKENS_FILE", "A2A_AUTH_TOKENS", "A2A_AUTH_TOKENS_FILE"} {
 		t.Setenv(k, "")
+		if err := os.Unsetenv(k); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

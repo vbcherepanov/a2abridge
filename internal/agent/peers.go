@@ -33,7 +33,7 @@ func NewPeers(tlsConfig *tls.Config, tokens *PeerTokens, log *slog.Logger) *Peer
 	if tlsConfig != nil {
 		transport.TLSClientConfig = tlsConfig.Clone()
 	}
-	client := &http.Client{Transport: &bearerTransport{next: transport, tokens: tokens}}
+	client := (&bearerTransport{next: transport, tokens: tokens}).client()
 	return &Peers{transport: transport, tokens: tokens, http: client, resolver: agentcard.NewResolver(client), log: log}
 }
 
@@ -65,7 +65,7 @@ func (p *Peers) Client(ctx context.Context, baseURL string) (*a2aclient.Client, 
 	nameTok, nameKeyed := p.tokens.forName(card.Name)
 	if nameKeyed {
 		transport = &bearerTransport{next: p.transport, tokens: p.tokens, nameOrigin: originOf(base), nameToken: nameTok}
-		httpClient = &http.Client{Transport: transport}
+		httpClient = transport.client()
 	}
 	// A card that sends the calls to another origin would quietly drop the
 	// token and get a 401 back; say why instead.

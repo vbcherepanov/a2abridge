@@ -261,3 +261,86 @@ func TestSubscribeUnauthenticatedWarns(t *testing.T) {
 		t.Errorf("no warning for an unauthenticated subscription: %q", logs.String())
 	}
 }
+
+// Codex 1: a peer cannot redirect our request to another configured peer
+// and have it carry that peer's token (confused deputy).
+func TestPeersRefuseRedirectIntoConfiguredPeer(t *testing.T) {
+	// A carries no token, its own URL-keyed token, or a name-keyed one (which
+	// goes through the per-name client).
+	for _, aKey := range []string{"none", "url", "name"} {
+		b := newRecordingPeer(t, "b", nil)
+		a := newRecordingPeer(t, "a", func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodPost {
+					http.Redirect(w, r, b.url+"/", http.StatusTemporaryRedirect)
+					return
+				}
+				next.ServeHTTP(w, r)
+			})
+		})
+		keys := b.url + "=b-" + outTok
+		switch aKey {
+		case "url":
+			keys += "," + a.url + "=a-" + outTok
+		case "name":
+			keys += ",a=a-" + outTok
+		}
+		err := sendVia(t, NewPeers(nil, mustPeerTokens(t, keys), discardLog()), a.url)
+		if err == nil || !strings.Contains(err.Error(), "refused to follow a redirect") {
+			t.Errorf("a key %s: err = %v, want a refused redirect", aKey, err)
+		} else if strings.Contains(err.Error(), outTok) {
+			t.Errorf("a key %s: error leaks a token", aKey)
+		}
+		if b.anyAuth() {
+			t.Errorf("a key %s: redirect target received its token", aKey)
+		}
+	}
+}
+
+// Codex 2: a token variable that is set but empty refuses startup instead
+// of turning auth off; unset stays off.
+func TestTokenVariablesSetButEmpty(t *testing.T) {
+	for _, tc := range []struct {
+		name, value string
+		load        func() error
+	}{
+		{"A2A_AUTH_TOKENS", "", authLoadErr},
+		{"A2A_AUTH_TOKENS", "  ", authLoadErr},
+		{"A2A_PEER_TOKENS", "", peerLoadErr},
+		{"A2A_AUTH_TOKENS_FILE", "", authLoadErr},
+		{"A2A_PEER_TOKENS_FILE", " ", peerLoadErr},
+	} {
+		clearTokenEnv(t)
+		t.Setenv(tc.name, tc.value)
+		err := tc.load()
+		if err == nil || !strings.Contains(err.Error(), tc.name+" is set but empty") {
+			t.Errorf("%s=%q: err = %v, want a set-but-empty refusal naming it", tc.name, tc.value, err)
+		}
+	}
+	clearTokenEnv(t)
+	if err := authLoadErr(); err != nil {
+		t.Errorf("unset A2A_AUTH_TOKENS: %v, want off without error", err)
+	}
+}
+
+// Codex 3: a path-scoped token is withheld from a path with encoded
+// separators, which a proxy may route differently from the decoded path.
+func TestURLKeyWithholdsEncodedSeparators(t *testing.T) {
+	pt := mustPeerTokens(t, "https://gw.example/a/b=T,https://root.example=R")
+	for raw, want := range map[string]string{
+		"https://gw.example/a/b/c":         "T",
+		"https://gw.example/a%2Fb":         "",
+		"https://gw.example/a/b/c%2Fd":     "",
+		"https://gw.example/a/b%2F..%2Fx":  "",
+		"https://root.example/x%2Fy":       "R",
+		"https://gw.example/a/b/%E2%9C%93": "T", // a plain escaped character keeps the default encoding
+	} {
+		u, err := url.Parse(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := pt.forURL(u); got != want {
+			t.Errorf("forURL(%s) = %q, want %q", raw, got, want)
+		}
+	}
+}

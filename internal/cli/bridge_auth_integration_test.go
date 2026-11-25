@@ -744,6 +744,8 @@ func TestAuthRefusesBadConfig(t *testing.T) {
 		{"empty outbound token", []string{"A2A_PEER_TOKENS=hermes="}, "entry 1"},
 		{"variable and file both set", []string{"A2A_AUTH_TOKENS=hermes:" + inboundToken, "A2A_AUTH_TOKENS_FILE=" + tokenFile}, "A2A_AUTH_TOKENS_FILE"},
 		{"unreadable file", []string{"A2A_PEER_TOKENS_FILE=" + filepath.Join(t.TempDir(), "missing")}, "A2A_PEER_TOKENS_FILE"},
+		{"empty inbound variable", []string{"A2A_AUTH_TOKENS="}, "A2A_AUTH_TOKENS is set but empty"},
+		{"empty outbound variable", []string{"A2A_PEER_TOKENS="}, "A2A_PEER_TOKENS is set but empty"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
