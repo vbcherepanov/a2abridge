@@ -63,6 +63,9 @@ func TestTokenConfigRefusesMistakes(t *testing.T) {
 		{"same inbound token twice", map[string]string{"A2A_AUTH_TOKENS": "alice:" + inTok + ",bob:x,carol:" + inTok}, authLoadErr, "entries 1 and 3"},
 		{"inline comment", map[string]string{"A2A_AUTH_TOKENS": "alice:" + inTok + " # laptop"}, authLoadErr, "entry 1"},
 		{"space in outbound token", map[string]string{"A2A_PEER_TOKENS": "hermes=ab cd"}, peerLoadErr, "entry 1"},
+		// A bare base64 token with padding splits at its first '=' into a
+		// "name" (most of the secret) and the token "=".
+		{"bare padded token", map[string]string{"A2A_PEER_TOKENS": "x=a,Zm9vYmFyYmF6cXV4=="}, peerLoadErr, "entry 2"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -77,7 +80,7 @@ func TestTokenConfigRefusesMistakes(t *testing.T) {
 			if !strings.Contains(err.Error(), tc.want) {
 				t.Errorf("error %q does not mention %q", err, tc.want)
 			}
-			for _, secret := range []string{outTok, inTok, "ab cd"} {
+			for _, secret := range []string{outTok, inTok, "ab cd", "Zm9vYmFyYmF6cXV4"} {
 				if strings.Contains(err.Error(), secret) {
 					t.Errorf("error leaks a token: %q", err)
 				}

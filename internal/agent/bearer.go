@@ -74,7 +74,9 @@ func LoadPeerTokens() (*PeerTokens, error) {
 		n := i + 1
 		key, tok, ok := strings.Cut(e, "=")
 		key, tok = strings.TrimSpace(key), strings.TrimSpace(tok)
-		if !ok || key == "" || tok == "" {
+		// A token of only '=' is a bare base64 token with padding that split
+		// at its first '=': the "peer" would be most of the secret.
+		if !ok || key == "" || strings.Trim(tok, "=") == "" {
 			return nil, fmt.Errorf("%s entry %d: want peer=token, with a base URL or an agent name as peer", envName, n)
 		}
 		if err := checkToken(tok); err != nil {
