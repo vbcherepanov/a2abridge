@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Bearer tokens for peer calls** ([#47](https://github.com/vbcherepanov/a2abridge/issues/47)),
+  for A2A agents without client certificates, such as Hermes.
+  `A2A_PEER_TOKENS` (or `A2A_PEER_TOKENS_FILE`) sends `Authorization: Bearer`
+  to the peer each token is configured for, matched by base URL or by Agent
+  Card name. It never goes over plain HTTP to a host that is not loopback, and
+  never across a redirect to another host. `A2A_AUTH_TOKENS` (or
+  `A2A_AUTH_TOKENS_FILE`) takes `name:token` pairs. Without a valid token,
+  protocol routes and `/metrics` answer `401` with `WWW-Authenticate: Bearer`,
+  while the Agent Card and `/healthz` stay open. The card lists the bearer
+  scheme, and the token's name reaches the agent as `authName` next to the
+  self-reported `from`. With mTLS on, a request needs both. A malformed
+  configuration stops the bridge at startup without printing the token.
+
 ### Changed
 
 - **a2a-go v2.9.0.** Its Agent Card handler now sets `ETag` and answers
