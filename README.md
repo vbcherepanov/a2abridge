@@ -477,7 +477,10 @@ session wakes up and answers with `a2a_complete_task`, and nobody has to type
 into the terminal. The message also stays in the inbox, so the prompt hook
 still shows it if the event never arrives.
 
-Channels are a Claude Code research preview, and two things are needed:
+Channels are a Claude Code research preview. They need a claude.ai login or
+a Console API key (not Amazon Bedrock, Google Cloud or Microsoft Foundry), an
+organization whose `channelsEnabled` policy allows them, and two things on
+your side:
 
 - **The server is in `.mcp.json` or the user config** (`~/.claude.json`, as
   `a2abridge install` writes it). Claude Code's channel lookup does not find a
@@ -496,7 +499,7 @@ Each event carries `task_id`, `context_id`, `claimed_from` and, for a reply to
 your own task, `kind="outgoing-reply"`. `claimed_from` is the name the sender
 gave itself; it is not verified, and the MCP instructions tell Claude so. With
 federation TLS on, the event also carries `peer_cert`, the name in the
-sender's verified client certificate.
+sender's verified client certificate; replies to your own tasks never carry it.
 
 In this mode the bridge offers MCP protocol versions up to 2025-11-25 only.
 Claude Code does not deliver channel events on a connection that negotiated
@@ -505,7 +508,10 @@ the 2026-07-28 revision. Other modes are unaffected.
 Claude Code does not confirm that it registered a channel, so the bridge
 cannot detect a session that was started without the flag. It writes one
 warning to `./.a2a/bridge.log` with the first event, and another if the
-client is not Claude Code or uses the 2026-07-28 revision.
+client is not Claude Code or uses the 2026-07-28 revision. A message that
+arrives before Claude Code has connected is not pushed; it waits in the inbox
+for the prompt hook. `A2A_RESPONDER` takes precedence over `A2A_NUDGE`, so
+leave it unset in this mode.
 
 ## Troubleshooting
 

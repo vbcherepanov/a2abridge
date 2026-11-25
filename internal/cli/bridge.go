@@ -193,6 +193,9 @@ func RunBridge(args []string, _, stderr io.Writer) int {
 			defer r.Close()
 			log.Info("autonomous responder enabled", "mode", responderMode)
 		}
+		if nudgeMode != "" {
+			log.Warn("A2A_NUDGE is ignored while A2A_RESPONDER is set", "nudge", nudgeMode)
+		}
 	} else if nudgeMode != "" {
 		if nudgeMode == "auto" {
 			nudgeMode = agent.DetectNudgeMode()

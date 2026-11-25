@@ -4,9 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"net/http/httptest"
 	"slices"
 	"strings"
@@ -30,8 +35,10 @@ type stdioPeer struct {
 }
 
 // startStdio serves srv over in-memory pipes with the given stdio options.
-// mcp-go keeps one global stdio session, so tests using it must not run in
-// parallel.
+// mcp-go v1.6.0 keeps one global stdio session: its initialized flag and its
+// notification queue carry over from one test to the next. Tests using it
+// must not run in parallel, and none may rely on the session being
+// uninitialized (Channel keeps its own ready flag for that).
 func startStdio(t *testing.T, srv *server.MCPServer, opts ...server.StdioOption) *stdioPeer {
 	t.Helper()
 	inR, inW := io.Pipe()
@@ -202,7 +209,7 @@ func TestChannelWakesSessionOnInboundMessage(t *testing.T) {
 		t.Errorf("initialize capabilities.experimental = %v, want claude/channel", exp)
 	}
 	instr, _ := res["instructions"].(string)
-	for _, want := range []string{"claimed_from", "not verified", "a2a_complete_task", "task_id"} {
+	for _, want := range []string{"claimed_from", "not verified", "a2a_complete_task", "task_id", "peer_cert", "never the user's approval"} {
 		if !strings.Contains(instr, want) {
 			t.Errorf("instructions do not mention %q: %q", want, instr)
 		}
@@ -226,6 +233,9 @@ func TestChannelWakesSessionOnInboundMessage(t *testing.T) {
 	}
 	if _, ok := meta["peer_cert"]; ok {
 		t.Errorf("meta.peer_cert = %v on a plain-HTTP bridge, want none", meta["peer_cert"])
+	}
+	if _, ok := meta["kind"]; ok {
+		t.Errorf("meta.kind = %v on a peer's message, want none (kind marks replies only)", meta["kind"])
 	}
 	for k := range meta {
 		for _, r := range k {
@@ -489,9 +499,107 @@ func TestChannelWarnsOnceOnFirstEvent(t *testing.T) {
 	}
 }
 
-// An event that arrives before the MCP server is attached is not lost: it
-// stays in the inbox for the prompt hook, and the bridge does not panic.
-func TestChannelHandleBeforeAttachIsSafe(t *testing.T) {
-	ch := NewChannel(discardLog())
-	ch.Handle(&InboxEntry{TaskID: "t", Text: "early"})
+// noChannelEvent fails if a channel notification shows up within d.
+func (p *stdioPeer) noChannelEvent(t *testing.T, d time.Duration) {
+	t.Helper()
+	deadline := time.After(d)
+	for {
+		select {
+		case m, ok := <-p.lines:
+			if !ok {
+				return
+			}
+			if m["method"] == channelMethod {
+				t.Fatalf("channel event sent before any client initialized: %v", m)
+			}
+		case <-deadline:
+			return
+		}
+	}
+}
+
+// infoLog captures info-level and above.
+func infoLog() (*slog.Logger, *syncBuffer) {
+	buf := &syncBuffer{}
+	return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelInfo})), buf
+}
+
+// Before any client has run initialize, mcp-go has no session to send to.
+// The bridge must say the event was not sent (the message waits in the
+// inbox for the prompt hook) instead of logging it as sent, and must not use
+// up the one-time delivery warning on it.
+func TestChannelHandleBeforeInitializeIsNotSent(t *testing.T) {
+	log, buf := infoLog()
+	ch := NewChannel(log)
+	ch.Handle(&InboxEntry{TaskID: "t0", Text: "before attach"}) // no server yet: no panic
+
+	srv := server.NewMCPServer("a2abridge", "test", ch.ServerOptions()...)
+	ch.Attach(srv)
+	p := startStdio(t, srv, ch.StdioOptions()...)
+	ch.Handle(&InboxEntry{TaskID: "t1", Text: "before initialize"})
+	p.noChannelEvent(t, 300*time.Millisecond)
+
+	out := buf.String()
+	if strings.Contains(out, "channel event queued") {
+		t.Errorf("log claims an event was queued before initialize:\n%s", out)
+	}
+	if !strings.Contains(out, "channel event not sent") || !strings.Contains(out, "inbox") {
+		t.Errorf("log should say the event was not sent and the message waits in the inbox:\n%s", out)
+	}
+	if len(buf.warnings()) != 0 {
+		t.Errorf("warnings before any event went out = %q, want none", buf.warnings())
+	}
+
+	p.initialize(t, "claude-code", "2025-11-25")
+	ch.Handle(&InboxEntry{TaskID: "t2", Text: "after initialize"})
+	if got := p.channelEvent(t)["content"]; got != "after initialize" {
+		t.Errorf("first event after initialize = %v, want the new message", got)
+	}
+}
+
+// PeerCert feeds the channel event only; it never reaches the inbox file.
+func TestPeerCertIsNotPersisted(t *testing.T) {
+	b, err := json.Marshal(InboxEntry{TaskID: "t", PeerCert: "laptop-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "laptop-a") {
+		t.Errorf("InboxEntry JSON = %s, want no peer certificate name", b)
+	}
+}
+
+func TestCertName(t *testing.T) {
+	cases := []struct {
+		name string
+		cert *x509.Certificate
+		want string
+	}{
+		{"CN wins over SANs", &x509.Certificate{Subject: pkix.Name{CommonName: "laptop-a"}, DNSNames: []string{"a.example"}, IPAddresses: []net.IP{net.ParseIP("10.0.0.1")}}, "laptop-a"},
+		{"first DNS SAN without CN", &x509.Certificate{DNSNames: []string{"a.example", "b.example"}, IPAddresses: []net.IP{net.ParseIP("10.0.0.1")}}, "a.example"},
+		{"IP SAN only", &x509.Certificate{IPAddresses: []net.IP{net.ParseIP("10.0.0.1")}}, "10.0.0.1"},
+		{"nothing to name", &x509.Certificate{}, ""},
+	}
+	for _, tc := range cases {
+		if got := certName(tc.cert); got != tc.want {
+			t.Errorf("%s: certName = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// With a real CA chain the client sends leaf then issuer; peer_cert must
+// name the leaf, never the CA every peer shares.
+func TestPeerCertNamesTheLeafOfAChain(t *testing.T) {
+	leaf := &x509.Certificate{Subject: pkix.Name{CommonName: "laptop-a"}}
+	ca := &x509.Certificate{Subject: pkix.Name{CommonName: "Fleet CA"}}
+	a := newTestAgentWithServer(t, "me", func(s *http.Server) {
+		next := s.Handler
+		s.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{leaf, ca}}
+			next.ServeHTTP(w, r)
+		})
+	})
+	task := sendImmediate(t, a.client(t), userMessage("hi"))
+	if got := a.inboxEntryFor(t, task.ID).PeerCert; got != "laptop-a" {
+		t.Errorf("PeerCert = %q, want the leaf's name laptop-a", got)
+	}
 }
