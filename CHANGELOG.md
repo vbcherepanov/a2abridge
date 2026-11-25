@@ -18,8 +18,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   protocol routes and `/metrics` answer `401` with `WWW-Authenticate: Bearer`,
   while the Agent Card and `/healthz` stay open. The card lists the bearer
   scheme, and the token's name reaches the agent as `authName` next to the
-  self-reported `from`. With mTLS on, a request needs both. A malformed
-  configuration stops the bridge at startup without printing the token.
+  self-reported `from`: in `a2a_inbox`, the prompt hook, the `on-inbound`
+  user hook (`A2A_EVENT_AUTH_NAME`) and the `A2A_RESPONDER` prompt. With mTLS
+  on, a request needs both. A malformed configuration stops the bridge at
+  startup without printing the token, and the token variables are dropped
+  from the environment that child processes inherit.
+
+### Fixed
+
+- **The prompt hook no longer lets a peer forge a message line.** A `from`
+  with a backtick or a line break could fake another sender's line in the
+  injected context. Labels lose their backticks, and line breaks in any
+  field become spaces.
 
 ### Changed
 

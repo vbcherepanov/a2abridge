@@ -433,7 +433,7 @@ Set per-bridge environment in your IDE config (the installer fills sensible defa
 | `A2A_RESPONDER` | unset | auto-answer inbound messages with a headless `claude` or `codex` CLI |
 | `A2A_PUSH_ALLOW_PRIVATE` | unset | `1` lets push-notification webhooks reach loopback/private addresses while federation TLS is on (a loopback bridge always allows them) |
 | `A2A_PEER_TOKENS` | unset | outbound bearer tokens, `peer=token` pairs separated by commas; `peer` is a base URL or a peer's Agent Card name |
-| `A2A_PEER_TOKENS_FILE` | unset | path to a file holding the same pairs, one per line or comma-separated (`#` comments allowed); set this or `A2A_PEER_TOKENS`, not both |
+| `A2A_PEER_TOKENS_FILE` | unset | path to a file holding the same pairs, one per line or comma-separated (a `#` comment takes a whole line); set this or `A2A_PEER_TOKENS`, not both |
 | `A2A_AUTH_TOKENS` | unset | inbound bearer tokens, `name:token` pairs separated by commas (the format Hermes uses); when set, callers need one of them |
 | `A2A_AUTH_TOKENS_FILE` | unset | path to a file holding the same pairs; set this or `A2A_AUTH_TOKENS`, not both |
 
@@ -457,26 +457,38 @@ On the Hermes side the bridge is a peer with
 `auth: { type: bearer, token: "tok-for-bridge" }`.
 
 - **Outbound**, a token goes only to the peer it is configured for. A URL key
-  matches that origin (scheme, host and port) and path prefix. A name key
-  matches the `name` in the Agent Card fetched from `peer_url`, and the token
-  goes only to that `peer_url`'s origin. When both match, the URL key wins.
-  A name key trusts the name the peer chose for itself, so give a peer on
-  another machine a URL key.
+  matches that origin (scheme, host and port) and path prefix; a path-scoped
+  key is not sent to a path with `..`, `.`, `//` or `\` in it. A name key
+  matches the `name` in the Agent Card fetched from `peer_url` exactly
+  (case-sensitive), and the token goes only to that `peer_url`'s origin. When
+  both match, the URL key wins. A name key trusts the name the peer chose for
+  itself, so give a peer on another machine a URL key. A key without a scheme
+  is a name, so write URLs with `https://`; the startup log lists every URL
+  key and name key, never the tokens.
 - A token is never sent over plain HTTP to a host that is not loopback. A URL
   key like that stops the bridge at startup, and a call that would send one
-  fails with an error that says why. A redirect to another host, or an Agent
-  Card interface on another origin, gets no token.
+  fails with an error that says why. A redirect to another host gets no
+  token. A peer whose Agent Card sends the calls to another origin is refused
+  with an error saying so, instead of being called without its token.
 - **Inbound**, a request without a valid token gets `401` with
-  `WWW-Authenticate: Bearer`. The Agent Card and `/healthz` stay open, and
-  `/metrics` needs a token. The card lists the bearer scheme in
-  `securitySchemes`. The token's name reaches the agent as `authName`, next to
-  the `from` the sender writes itself: `a2a_inbox` returns both, and the
-  prompt hook shows ``from `alice` (claimed) · token `hermes` ``.
+  `WWW-Authenticate: Bearer`, and the bridge logs a warning (at most one a
+  minute) with the caller's address, the path and the reason. The Agent Card
+  and `/healthz` stay open, and `/metrics` needs a token. The card lists the
+  bearer scheme in `securitySchemes`. The token's name reaches the agent as
+  `authName`, next to the `from` the sender writes itself: `a2a_inbox` returns
+  both, the prompt hook shows ``from `alice` (claimed) · token `hermes` ``,
+  the `on-inbound` user hook gets `A2A_EVENT_AUTH_NAME`, and `A2A_RESPONDER`
+  labels both in its prompt.
+- Once a bridge sets `A2A_AUTH_TOKENS`, every other a2abridge that calls it
+  needs an `A2A_PEER_TOKENS` entry for it.
 - With mTLS federation on, a request needs a valid client certificate and a
   valid token.
-- A malformed entry, an unreadable file, or a variable set together with its
-  `_FILE` twin stops the bridge at startup. Errors name the entry, never the
-  token, and tokens never reach the log.
+- A malformed entry, a duplicate peer key, one token under two names, a token
+  with whitespace in it (a `#` comment must take a whole line), an unreadable
+  file, or a variable set together with its `_FILE` twin stops the bridge at
+  startup. Errors name the entry, never the token, and tokens never reach the
+  log. The bridge drops both token variables from its environment once read,
+  so the responder's `claude`/`codex` and the user hooks do not inherit them.
 
 ## How the inbox flow actually works
 
