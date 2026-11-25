@@ -78,6 +78,9 @@ func (e *Executor) Execute(ctx context.Context, ec *a2asrv.ExecutorContext) iter
 			From:      metadataString(ec.Message.Metadata, "from"),
 			Text:      messageText(ec.Message),
 		}
+		if ec.User != nil {
+			entry.PeerCert, _ = ec.User.Attributes[peerCertAttr].(string)
+		}
 		if !e.store.deliverIncoming(&entry) {
 			// The same messageId is already queued under another task: the
 			// host answers that one, so this redelivery gets nobody to reply.

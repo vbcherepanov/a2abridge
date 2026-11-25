@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`A2A_NUDGE=channel` wakes an idle Claude Code session through MCP
+  channels** (#46). Every incoming message, and every reply to a task this
+  agent sent, goes to the session as a `notifications/claude/channel` event
+  with `task_id`, `context_id`, `claimed_from` (the sender's own claim, not
+  verified) and, with federation TLS on, `peer_cert` (the verified certificate
+  name). In this mode the stdio server offers MCP versions up to 2025-11-25
+  only, because Claude Code skips channel events on a 2026-07-28 connection.
+  `auto` never picks `channel`. The bridge logs one warning on the first event,
+  since Claude Code does not confirm delivery, and one if the client is not
+  Claude Code or uses the 2026-07-28 revision. Needs the server in
+  `.mcp.json` or the user config and Claude Code started with
+  `--dangerously-load-development-channels server:<name>`.
+
 ### Changed
 
 - **a2a-go v2.9.0.** Its Agent Card handler now sets `ETag` and answers
