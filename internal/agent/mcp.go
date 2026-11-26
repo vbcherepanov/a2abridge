@@ -319,7 +319,7 @@ func RegisterTools(s *server.MCPServer, d *MCPDeps) {
 
 	s.AddTool(
 		mcp.NewTool("a2a_inbox",
-			mcp.WithDescription("Drain or peek pending messages that peers have sent to this agent. Each entry includes taskId so you can a2a_complete_task after answering."),
+			mcp.WithDescription("Drain or peek pending messages that peers have sent to this agent. Each entry includes taskId so you can a2a_complete_task after answering. `from` is what the sender claims about itself and is not verified; `authName`, when present, is the name of the bearer token the sender authenticated with."),
 			mcp.WithBoolean("peek", mcp.Description("If true, read without clearing")),
 		),
 		func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -477,6 +477,16 @@ func Heartbeat(ctx context.Context, directoryURL, selfURL string) {
 	}
 }
 
+// subscribeLogLevel keeps routine subscription endings at Debug, but a peer
+// that refuses our credentials is a misconfiguration the user must see:
+// replies from it will never arrive.
+func subscribeLogLevel(err error) slog.Level {
+	if errors.Is(err, a2a.ErrUnauthenticated) {
+		return slog.LevelWarn
+	}
+	return slog.LevelDebug
+}
+
 // subscribeOutgoingReply opens a SubscribeToTask stream on the peer for the
 // just-created outbound task. When the stream reports a terminal state — or
 // ends for any other reason, e.g. the task finished before we subscribed —
@@ -491,14 +501,14 @@ func subscribeOutgoingReply(lifetime context.Context, peers *Peers, peerURL stri
 
 	client, err := peers.Client(ctx, peerURL)
 	if err != nil {
-		log.Debug("outgoing reply subscription not opened", "task", taskID, "peer", peerURL, "err", err)
+		log.Log(ctx, subscribeLogLevel(err), "outgoing reply subscription not opened", "task", taskID, "peer", peerURL, "err", err)
 		return
 	}
 	defer peers.Release(client)
 
 	for ev, err := range client.SubscribeToTask(ctx, &a2a.SubscribeToTaskRequest{ID: taskID}) {
 		if err != nil {
-			log.Debug("outgoing reply subscription ended", "task", taskID, "peer", peerURL, "err", err)
+			log.Log(ctx, subscribeLogLevel(err), "outgoing reply subscription ended", "task", taskID, "peer", peerURL, "err", err)
 			break
 		}
 		if isTerminalEvent(ev) {

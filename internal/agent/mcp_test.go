@@ -37,7 +37,7 @@ func newTestMCP(t *testing.T, store *Store, executor *Executor) *server.MCPServe
 		Lifetime:     t.Context(),
 		Store:        store,
 		Executor:     executor,
-		Peers:        NewPeers(nil, discardLog()),
+		Peers:        NewPeers(nil, nil, discardLog()),
 		OwnCard:      &a2a.AgentCard{Name: "self"},
 		SelfURL:      "http://self.invalid",
 		DirectoryURL: "http://127.0.0.1:1", // unused by the tools under test

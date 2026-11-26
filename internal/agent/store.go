@@ -50,10 +50,14 @@ type InboxEntry struct {
 	TaskID    string `json:"taskId"`
 	ContextID string `json:"contextId"`
 	From      string `json:"from"`
-	Text      string `json:"text"`
-	Kind      string `json:"kind,omitempty"`
-	State     string `json:"state,omitempty"`
-	TS        string `json:"ts,omitempty"`
+	// AuthName is the name of the bearer token the sender authenticated
+	// with (A2A_AUTH_TOKENS). Unlike From, which the sender writes itself,
+	// the bridge verified it. Empty for an unauthenticated sender.
+	AuthName string `json:"authName,omitempty"`
+	Text     string `json:"text"`
+	Kind     string `json:"kind,omitempty"`
+	State    string `json:"state,omitempty"`
+	TS       string `json:"ts,omitempty"`
 
 	// PeerCert is the name in the sender's verified client certificate,
 	// set only when federation TLS is on. It feeds the channel event and
@@ -74,6 +78,7 @@ type snapshotEntry struct {
 	TaskID    string `json:"taskId"`
 	ContextID string `json:"contextId"`
 	From      string `json:"from"`
+	AuthName  string `json:"authName,omitempty"`
 	Text      string `json:"text"`
 	TS        string `json:"ts,omitempty"`
 }
@@ -401,11 +406,15 @@ func (s *Store) deliverIncoming(e *InboxEntry) bool {
 	// integrations (desktop notifications, Slack relay, audit log) get a
 	// turn. The hook's payload mirrors the synthetic-reply shape so
 	// scripts can be uniform across both events.
-	FireHook("on-inbound", map[string]any{
+	payload := map[string]any{
 		"taskId": e.TaskID,
 		"from":   e.From,
 		"text":   e.Text,
-	})
+	}
+	if e.AuthName != "" {
+		payload["authName"] = e.AuthName
+	}
+	FireHook("on-inbound", payload)
 	return true
 }
 
@@ -474,6 +483,7 @@ func (s *Store) LoadInbox() {
 			TaskID:    snap[i].TaskID,
 			ContextID: snap[i].ContextID,
 			From:      snap[i].From,
+			AuthName:  snap[i].AuthName,
 			Text:      snap[i].Text,
 			TS:        snap[i].TS,
 		}
@@ -502,6 +512,7 @@ func (s *Store) persistInboxLocked() {
 			TaskID:    e.TaskID,
 			ContextID: e.ContextID,
 			From:      e.From,
+			AuthName:  e.AuthName,
 			Text:      e.Text,
 			TS:        e.TS,
 		})

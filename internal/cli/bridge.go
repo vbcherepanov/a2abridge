@@ -88,6 +88,33 @@ func RunBridge(args []string, _, stderr io.Writer) int {
 	}
 	log := slog.New(h).With("agent", *name, "id", *idFlag, "state_dir", resolvedStateDir)
 
+	// Bearer tokens are checked before binding, so a bad configuration never
+	// holds the port. The errors name the entry, never the token.
+	peerTokens, err := agent.LoadPeerTokens()
+	var authTokens *agent.AuthTokens
+	if err == nil {
+		authTokens, err = agent.LoadAuthTokens()
+	}
+	if err != nil {
+		log.Error("bearer tokens", "err", err)
+		fmt.Fprintf(stderr, "a2abridge bridge: %v\n", err)
+		return 1
+	}
+	// The responder's claude/codex children and the user hooks inherit our
+	// environment; they have no use for the tokens.
+	for _, k := range []string{"A2A_PEER_TOKENS", "A2A_AUTH_TOKENS"} {
+		if err := os.Unsetenv(k); err != nil {
+			log.Warn("unset token variable", "var", k, "err", err)
+		}
+	}
+	if authTokens != nil {
+		log.Info("bearer auth on", "names", authTokens.Count())
+	}
+	if peerTokens != nil {
+		urls, names := peerTokens.Describe()
+		log.Info("outbound bearer tokens", "url_keys", len(urls), "name_keys", len(names), "urls", urls, "names", names)
+	}
+
 	// Bind is also our singleton lock. On a fast parent restart the previous
 	// bridge may still be releasing this port for a few hundred milliseconds, so
 	// retry a bounded number of times to let the new bridge win once the old one
@@ -167,6 +194,9 @@ func RunBridge(args []string, _, stderr io.Writer) int {
 	if *model != "" {
 		card.Description = card.Description + " | model=" + *model
 	}
+	if authTokens != nil {
+		agent.AdvertiseBearer(card)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -239,7 +269,7 @@ func RunBridge(args []string, _, stderr io.Writer) int {
 		log.Error("client tls config", "err", err)
 		return 1
 	}
-	peers := agent.NewPeers(clientTLS, log)
+	peers := agent.NewPeers(clientTLS, peerTokens, log)
 	// The SSRF guard matters once the bridge is reachable across machines; a
 	// loopback bridge's webhooks legitimately point at 127.0.0.1.
 	allowPrivatePush := !fed.Enabled() || os.Getenv("A2A_PUSH_ALLOW_PRIVATE") == "1"
@@ -260,7 +290,7 @@ func RunBridge(args []string, _, stderr io.Writer) int {
 		Log:          log,
 	})
 
-	a2aHandler, err := agent.NewA2AHTTPHandler(card, executor, tasks, pushConfigs, pushSender, log)
+	a2aHandler, err := agent.NewA2AHTTPHandler(card, executor, tasks, pushConfigs, pushSender, authTokens, log)
 	if err != nil {
 		log.Error("a2a handler", "err", err)
 		return 1

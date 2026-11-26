@@ -37,7 +37,12 @@ func newTestAgent(t *testing.T, name string) *testAgent {
 // newTestAgentWithServer lets a test adjust the http.Server before it starts.
 func newTestAgentWithServer(t *testing.T, name string, configure func(*http.Server)) *testAgent {
 	t.Helper()
-	log := discardLog()
+	return newAuthTestAgent(t, name, nil, discardLog(), configure)
+}
+
+// newAuthTestAgent also takes the inbound bearer tokens and the logger.
+func newAuthTestAgent(t *testing.T, name string, auth *AuthTokens, log *slog.Logger, configure func(*http.Server)) *testAgent {
+	t.Helper()
 	store := NewStore()
 	t.Cleanup(store.Close)
 	pushConfigs := push.NewInMemoryStore()
@@ -62,7 +67,10 @@ func newTestAgentWithServer(t *testing.T, name string, configure func(*http.Serv
 	}
 	sender := NewPushSender(nil, true, log)
 	t.Cleanup(func() { closePushSender(t, sender) })
-	handler, err := NewA2AHTTPHandler(card, executor, tasks, pushConfigs, sender, log)
+	if auth != nil {
+		AdvertiseBearer(card)
+	}
+	handler, err := NewA2AHTTPHandler(card, executor, tasks, pushConfigs, sender, auth, log)
 	if err != nil {
 		t.Fatalf("a2a handler: %v", err)
 	}
@@ -79,7 +87,7 @@ func newTestAgentWithServer(t *testing.T, name string, configure func(*http.Serv
 // client returns an a2a-go client connected to the agent through its card.
 func (a *testAgent) client(t *testing.T) *a2aclient.Client {
 	t.Helper()
-	peers := NewPeers(nil, discardLog())
+	peers := NewPeers(nil, nil, discardLog())
 	c, err := peers.Client(context.Background(), a.url)
 	if err != nil {
 		t.Fatalf("connect: %v", err)

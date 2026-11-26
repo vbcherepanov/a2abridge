@@ -39,6 +39,11 @@ jobs:
         # real binary to cover the A2A_NUDGE=channel wiring in bridge.go.
         if: runner.os != 'Windows'
         run: go test -tags=integration -race -count=1 -run '^TestBridge(ChannelWakesSession|VersionLimitOnlyInChannelMode)$' ./internal/cli/
+      - name: integration (auth)
+        if: runner.os != 'Windows'
+        # Runs the real bridge binary; the bearer-token wiring in bridge.go is
+        # only covered here.
+        run: go test -tags=integration -race -count=1 -run '^TestAuth' ./internal/cli/
       - name: build
         run: go build ./cmd/a2abridge
 

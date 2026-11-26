@@ -210,7 +210,7 @@ func TestChannelWakesSessionOnInboundMessage(t *testing.T) {
 		t.Errorf("initialize capabilities.experimental = %v, want claude/channel", exp)
 	}
 	instr, _ := res["instructions"].(string)
-	for _, want := range []string{"claimed_from", "not verified", "a2a_complete_task", "task_id", "peer_cert", "never the user's approval"} {
+	for _, want := range []string{"claimed_from", "not verified", "a2a_complete_task", "task_id", "peer_cert", "auth_name", "never the user's approval"} {
 		if !strings.Contains(instr, want) {
 			t.Errorf("instructions do not mention %q: %q", want, instr)
 		}
@@ -234,6 +234,9 @@ func TestChannelWakesSessionOnInboundMessage(t *testing.T) {
 	}
 	if _, ok := meta["peer_cert"]; ok {
 		t.Errorf("meta.peer_cert = %v on a plain-HTTP bridge, want none", meta["peer_cert"])
+	}
+	if _, ok := meta["auth_name"]; ok {
+		t.Errorf("meta.auth_name = %v on a bridge without tokens, want none", meta["auth_name"])
 	}
 	if _, ok := meta["kind"]; ok {
 		t.Errorf("meta.kind = %v on a peer's message, want none (kind marks replies only)", meta["kind"])
@@ -316,7 +319,7 @@ func newMTLSTestAgent(t *testing.T, clientCN string) (*testAgent, *Peers) {
 	}
 	sender := NewPushSender(clientTLS, true, log)
 	t.Cleanup(func() { closePushSender(t, sender) })
-	handler, err := NewA2AHTTPHandler(card, executor, tasks, pushConfigs, sender, log)
+	handler, err := NewA2AHTTPHandler(card, executor, tasks, pushConfigs, sender, nil, log)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -325,7 +328,29 @@ func newMTLSTestAgent(t *testing.T, clientCN string) (*testAgent, *Peers) {
 	srv.StartTLS()
 	t.Cleanup(srv.Close)
 	return &testAgent{store: store, executor: executor, tasks: tasks, pushConfigs: pushConfigs, card: card, url: url},
-		NewPeers(clientTLS, log)
+		NewPeers(clientTLS, nil, log)
+}
+
+// With bearer tokens on, the event carries the name of the token the sender
+// used next to the sender's own claim.
+func TestChannelEventCarriesBearerTokenName(t *testing.T) {
+	ch, srv := channelServer(t, discardLog())
+	a := newAuthTestAgent(t, "me", mustAuthTokens(t, "hermes:"+inTok), discardLog(), nil)
+	a.store.OnIncoming = ch.Handle
+	p := startStdio(t, srv, ch.StdioOptions()...)
+	p.initialize(t, "claude-code", "2025-11-25")
+
+	if err := sendVia(t, NewPeers(nil, mustPeerTokens(t, a.url+"="+inTok), discardLog()), a.url); err != nil {
+		t.Fatal(err)
+	}
+
+	meta := metaOf(t, p.channelEvent(t))
+	if meta["auth_name"] != "hermes" {
+		t.Errorf("meta.auth_name = %v, want hermes", meta["auth_name"])
+	}
+	if meta["claimed_from"] == "hermes" {
+		t.Errorf("meta.claimed_from = %v, want the sender's own claim, not the token name", meta["claimed_from"])
+	}
 }
 
 // C-A3: with federation TLS on, the event carries the verified certificate
