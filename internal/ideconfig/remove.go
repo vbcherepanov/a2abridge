@@ -1,13 +1,10 @@
 package ideconfig
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-
-	"github.com/BurntSushi/toml"
 )
 
 // removeJSONMCPEntry removes mcpServers.a2a from a JSON config. It also
@@ -94,41 +91,38 @@ func pruneUserPromptSubmitHook(hooks map[string]any) bool {
 	return true
 }
 
-// removeCodexEntry strips [mcp_servers.a2a] from Codex's TOML config.
+// removeCodexEntry strips [mcp_servers.a2a] and its sub-tables from Codex's
+// TOML config, leaving the rest of the file byte for byte as it was.
 func removeCodexEntry(path string) error {
 	if !fileExists(path) {
 		return nil
 	}
-	b, err := os.ReadFile(path)
+	raw, root, err := readTOMLConfig(path)
 	if err != nil {
 		return err
-	}
-	root := map[string]any{}
-	if len(b) > 0 {
-		if err := toml.Unmarshal(b, &root); err != nil {
-			return fmt.Errorf("parse %s: %w", path, err)
-		}
 	}
 	servers, _ := root["mcp_servers"].(map[string]any)
 	if servers == nil {
 		return nil
 	}
-	if _, ok := servers["a2a"]; !ok {
+	if _, ok := servers[codexServerKey]; !ok {
 		return nil
 	}
-	delete(servers, "a2a")
+	delete(servers, codexServerKey)
 	if len(servers) == 0 {
 		delete(root, "mcp_servers")
 	}
 
+	out, _, err := renderTOMLConfig(root, func() ([]byte, error) {
+		return stripCodexEntry(raw, codexServerKey), nil
+	})
+	if err != nil {
+		return err
+	}
 	if _, err := backupFile(path); err != nil {
 		return fmt.Errorf("backup: %w", err)
 	}
-	var buf bytes.Buffer
-	if err := toml.NewEncoder(&buf).Encode(root); err != nil {
-		return err
-	}
-	return writeFileAtomic(path, buf.Bytes(), newConfigMode)
+	return writeFileAtomic(path, out, newConfigMode)
 }
 
 // removeClaudeEntries cleans both Claude Code files: mcpServers.a2a in

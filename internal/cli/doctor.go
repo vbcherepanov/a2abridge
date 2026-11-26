@@ -228,8 +228,9 @@ func printResults(w io.Writer, results []checkResult) string {
 	return worst
 }
 
+// currentExe is the binary path install would write into IDE configs.
 func currentExe() string {
-	if e, err := os.Executable(); err == nil {
+	if e, err := resolveBinaryPath(""); err == nil {
 		return e
 	}
 	return "a2abridge"

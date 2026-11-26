@@ -249,11 +249,12 @@ func writeJSONConfig(name, path string, dryRun bool, mutate func(root map[string
 	return res
 }
 
-// setMCPServerEntry installs the desired mcpServers.<key> block into root.
-// Returns false when the entry is already up to date.
+// setMCPServerEntry merges the desired mcpServers.<key> block into root,
+// keeping whatever else the user stored in that entry. Returns false when
+// the entry is already up to date.
 func setMCPServerEntry(root map[string]any, spec Spec) bool {
 	servers := ensureNestedMap(root, "mcpServers")
-	desired := mcpEntryJSON(spec)
+	desired := mergeMCPEntry(servers[spec.Key], spec)
 	if equalJSON(servers[spec.Key], desired) {
 		return false
 	}

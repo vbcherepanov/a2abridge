@@ -1,12 +1,14 @@
 package cli
 
 import (
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -61,31 +63,22 @@ func RunInstall(args []string, stdout, stderr io.Writer) int {
 		*apply = false
 	}
 
-	// Resolve the binary path: caller can override; otherwise use our own.
-	exe := *binary
-	if exe == "" {
-		me, err := os.Executable()
-		if err != nil {
-			fmt.Fprintf(stderr, "install: locate own binary: %v\n", err)
-			return 1
-		}
-		// Prefer the symlink-resolved path so configs survive directory moves.
-		if resolved, rerr := filepath.EvalSymlinks(me); rerr == nil {
-			me = resolved
-		}
-		exe = me
-	}
-	// IDE configs must reference an absolute path — the IDE's working
-	// directory is unrelated to wherever install was invoked from.
-	abs, err := filepath.Abs(exe)
+	exe, err := resolveBinaryPath(*binary)
 	if err != nil {
-		fmt.Fprintf(stderr, "install: resolve binary path %q: %v\n", exe, err)
+		fmt.Fprintf(stderr, "install: %v\n", err)
 		return 1
 	}
-	exe = abs
 
 	spec := ideconfig.DefaultSpec(exe)
-	spec.Env["A2A_DIRECTORY"] = *directory
+	spec.Env[envDirectory] = *directory
+	// A directory the user typed replaces the one in the config. The
+	// built-in default only fills a gap, so re-running install never
+	// resets a directory URL the user picked earlier.
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "directory" {
+			spec.ForceEnv = map[string]bool{envDirectory: true}
+		}
+	})
 	if home, herr := os.UserHomeDir(); herr == nil {
 		// Wire the embedded hook into Claude Code's UserPromptSubmit. The
 		// hook itself is copied later by installHook(); here we just point
@@ -138,10 +131,14 @@ func RunInstall(args []string, stdout, stderr io.Writer) int {
 				fmt.Fprintf(stdout, "  [write]  %-15s  %s  (created)\n", res.IDE, res.Path)
 			}
 		}
+		if res.Note != "" {
+			fmt.Fprintf(stdout, "           %-15s  note: %s\n", "", res.Note)
+		}
 	}
 
-	// Skill + hook install (Claude Code only). Both have backup-on-overwrite
-	// semantics so re-running install --apply doesn't clobber user edits.
+	// Skill + hook install (Claude Code only). Both are left alone when
+	// already current and backed up before an overwrite, so re-running
+	// install --apply doesn't clobber user edits.
 	skillFailed := false
 	if shouldInstallExtras(*ideFlag) {
 		if err := installSkill(stdout, *apply); err != nil {
@@ -198,9 +195,40 @@ func shouldInstallExtras(ideFlag string) bool {
 	return false
 }
 
+// envDirectory is the env var that points a bridge at the directory daemon.
+const envDirectory = "A2A_DIRECTORY"
+
+// backupStamp is the timestamp layout used in backup names.
+const backupStamp = "20060102-150405"
+
+// resolveBinaryPath returns the absolute path IDE configs should launch.
+// override wins; otherwise it is this executable with symlinks resolved,
+// so configs survive directory moves. install and doctor share it: a
+// different answer in doctor would report a fresh install as stale.
+func resolveBinaryPath(override string) (string, error) {
+	exe := override
+	if exe == "" {
+		me, err := os.Executable()
+		if err != nil {
+			return "", fmt.Errorf("locate own binary: %w", err)
+		}
+		if resolved, rerr := filepath.EvalSymlinks(me); rerr == nil {
+			me = resolved
+		}
+		exe = me
+	}
+	// IDE configs must reference an absolute path — the IDE's working
+	// directory is unrelated to wherever install was invoked from.
+	abs, err := filepath.Abs(exe)
+	if err != nil {
+		return "", fmt.Errorf("resolve binary path %q: %w", exe, err)
+	}
+	return abs, nil
+}
+
 // installSkill drops the embedded skill into ~/.claude/skills/a2a-bridge/.
-// Backups: any pre-existing file at the destination is renamed to
-// `<name>.bak.<timestamp>` before it gets overwritten.
+// A skill that already matches is left alone. A different one is moved to
+// ~/.a2abridge/backups first.
 func installSkill(stdout io.Writer, apply bool) error {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -212,23 +240,37 @@ func installSkill(stdout io.Writer, apply bool) error {
 		return fmt.Errorf("embed skill fs: %w", err)
 	}
 
+	same, err := assets.TreeMatches(src, target)
+	if err != nil {
+		return fmt.Errorf("compare skill: %w", err)
+	}
+	if same {
+		fmt.Fprintf(stdout, "  [skip]   skill            %s — already up to date\n", target)
+		return nil
+	}
 	if !apply {
 		fmt.Fprintf(stdout, "  [plan]   skill            %s\n", target)
 		return nil
 	}
 
-	if err := backupTreeOnce(target); err != nil {
+	bak, err := moveToBackups(home, target, "skill-a2a-bridge")
+	if err != nil {
 		return fmt.Errorf("backup skill tree: %w", err)
 	}
 	if err := assets.CopyTree(src, target); err != nil {
 		return fmt.Errorf("copy skill: %w", err)
 	}
-	fmt.Fprintf(stdout, "  [write]  skill            %s\n", target)
+	if bak != "" {
+		fmt.Fprintf(stdout, "  [write]  skill            %s  (backup → %s)\n", target, bak)
+	} else {
+		fmt.Fprintf(stdout, "  [write]  skill            %s\n", target)
+	}
 	return nil
 }
 
 // installHook copies the embedded UserPromptSubmit hook into
-// ~/.claude/hooks/a2a-inbox-hook.sh with execute permission.
+// ~/.claude/hooks/a2a-inbox-hook.sh with execute permission. A hook that
+// already matches is left alone.
 func installHook(stdout io.Writer, apply bool) error {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -236,6 +278,14 @@ func installHook(stdout io.Writer, apply bool) error {
 	}
 	target := filepath.Join(home, ".claude", "hooks", "a2a-inbox-hook.sh")
 
+	existing, readErr := os.ReadFile(target)
+	if readErr != nil && !os.IsNotExist(readErr) {
+		return fmt.Errorf("read existing hook: %w", readErr)
+	}
+	if readErr == nil && bytes.Equal(existing, assets.HookScript()) && hookExecutable(target) {
+		fmt.Fprintf(stdout, "  [skip]   hook             %s — already up to date\n", target)
+		return nil
+	}
 	if !apply {
 		fmt.Fprintf(stdout, "  [plan]   hook             %s\n", target)
 		return nil
@@ -244,8 +294,8 @@ func installHook(stdout io.Writer, apply bool) error {
 	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 		return err
 	}
-	if _, statErr := os.Stat(target); statErr == nil {
-		bak := target + ".bak." + time.Now().Format("20060102-150405")
+	if readErr == nil {
+		bak := target + ".bak." + time.Now().Format(backupStamp)
 		if err := os.Rename(target, bak); err != nil {
 			return fmt.Errorf("backup existing hook: %w", err)
 		}
@@ -257,25 +307,44 @@ func installHook(stdout io.Writer, apply bool) error {
 	return nil
 }
 
-// backupTreeOnce renames the entire target directory to `<dir>.bak.<ts>`
-// the first time we touch it, so the original skill is preserved as a
-// single tree (rather than per-file backups scattered across references/).
-// A no-op when the target does not exist.
-func backupTreeOnce(target string) error {
-	info, err := os.Stat(target)
+// hookExecutable reports whether the hook can be run. Windows has no
+// execute bit, so any existing file counts there.
+func hookExecutable(path string) bool {
+	info, err := os.Stat(path)
 	if err != nil {
+		return false
+	}
+	return runtime.GOOS == "windows" || info.Mode().Perm()&0o111 != 0
+}
+
+// moveToBackups moves path to ~/.a2abridge/backups/<name>.<timestamp> and
+// returns the new location, or "" when path does not exist. Backups of the
+// skill must not stay inside ~/.claude/skills: Claude Code loads every
+// directory there, so a "<skill>.bak.<ts>" copy shows up as a second skill.
+func moveToBackups(home, path, name string) (string, error) {
+	if _, err := os.Lstat(path); err != nil {
 		if os.IsNotExist(err) {
-			return nil
+			return "", nil
 		}
-		return err
+		return "", err
 	}
-	if !info.IsDir() {
-		// Unlikely, but if a file is in the way, rename it out of the way.
-		bak := target + ".bak." + time.Now().Format("20060102-150405")
-		return os.Rename(target, bak)
+	dir := filepath.Join(home, ".a2abridge", "backups")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
 	}
-	bak := target + ".bak." + time.Now().Format("20060102-150405")
-	return os.Rename(target, bak)
+	dst := filepath.Join(dir, name+"."+time.Now().Format(backupStamp))
+	if err := os.Rename(path, dst); err == nil {
+		return dst, nil
+	}
+	// Rename fails across filesystems (a symlinked ~/.claude, for one):
+	// copy the tree, then remove the original.
+	if err := os.CopyFS(dst, os.DirFS(path)); err != nil {
+		return "", err
+	}
+	if err := os.RemoveAll(path); err != nil {
+		return "", err
+	}
+	return dst, nil
 }
 
 // parseIDEFilter normalises the --ide value to a set of writer names
