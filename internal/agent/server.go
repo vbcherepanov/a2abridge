@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"context"
+	"crypto/x509"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -56,7 +58,7 @@ func NewA2AHTTPHandler(
 	handler := a2asrv.NewHandler(utcExecutor{next: executor},
 		a2asrv.WithTaskStore(tasks),
 		a2asrv.WithPushNotifications(pushConfigs, pushSender),
-		a2asrv.WithCallInterceptors(enforcer),
+		a2asrv.WithCallInterceptors(enforcer, peerCertInterceptor{}),
 		a2asrv.WithLogger(log),
 	)
 	guard := &protocolGuard{tasks: tasks, streaming: card.Capabilities.Streaming, log: log}
@@ -83,6 +85,52 @@ func NewA2AHTTPHandler(
 		if r.Body != nil && r.Body != http.NoBody {
 			r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 		}
+		if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+			r = r.WithContext(context.WithValue(r.Context(), peerCertKey{}, certName(r.TLS.PeerCertificates[0])))
+		}
 		mux.ServeHTTP(w, r)
 	}), nil
+}
+
+// peerCertAttr is the a2asrv.User attribute holding the name in the
+// caller's verified client certificate.
+const peerCertAttr = "peerCert"
+
+type peerCertKey struct{}
+
+// peerCertInterceptor copies the verified client-certificate name from the
+// HTTP request into the call's User, which a2a-go hands to the executor.
+// It adds an attribute and leaves the rest of the User as it is.
+type peerCertInterceptor struct {
+	a2asrv.PassthroughCallInterceptor
+}
+
+func (peerCertInterceptor) Before(ctx context.Context, callCtx *a2asrv.CallContext, _ *a2asrv.Request) (context.Context, any, error) {
+	name, _ := ctx.Value(peerCertKey{}).(string)
+	if name == "" {
+		return ctx, nil, nil
+	}
+	if callCtx.User == nil {
+		callCtx.User = &a2asrv.User{}
+	}
+	if callCtx.User.Attributes == nil {
+		callCtx.User.Attributes = map[string]any{}
+	}
+	callCtx.User.Attributes[peerCertAttr] = name
+	return ctx, nil, nil
+}
+
+// certName is the name a certificate identifies: its CN, else its first DNS
+// SAN, else its first IP SAN. The server's TLS config has already verified
+// the chain (and A2A_PEER_ALLOW) before a request gets here.
+func certName(cert *x509.Certificate) string {
+	switch {
+	case cert.Subject.CommonName != "":
+		return cert.Subject.CommonName
+	case len(cert.DNSNames) > 0:
+		return cert.DNSNames[0]
+	case len(cert.IPAddresses) > 0:
+		return cert.IPAddresses[0].String()
+	}
+	return ""
 }

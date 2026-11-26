@@ -180,6 +180,10 @@ func RunBridge(args []string, _, stderr io.Writer) int {
 	// no-op and we rely on the stdin-EOF shutdown below (ServeStdio returning).
 	setParentDeathSignal(log)
 
+	// channel stays nil unless A2A_NUDGE=channel; a nil *agent.Channel adds
+	// no MCP options and handles nothing.
+	var channel *agent.Channel
+
 	if responderMode != "" {
 		r, rerr := agent.NewResponder(responderMode, card, executor, log)
 		if rerr != nil {
@@ -189,6 +193,9 @@ func RunBridge(args []string, _, stderr io.Writer) int {
 			defer r.Close()
 			log.Info("autonomous responder enabled", "mode", responderMode)
 		}
+		if nudgeMode != "" {
+			log.Warn("A2A_NUDGE is ignored while A2A_RESPONDER is set", "nudge", nudgeMode)
+		}
 	} else if nudgeMode != "" {
 		if nudgeMode == "auto" {
 			nudgeMode = agent.DetectNudgeMode()
@@ -196,6 +203,13 @@ func RunBridge(args []string, _, stderr io.Writer) int {
 		switch nudgeMode {
 		case "":
 			log.Warn("A2A_NUDGE=auto but no backend detected (not in tmux, not on darwin)")
+		case "channel":
+			// Push each message into the Claude Code session as an MCP
+			// channel event. Only an explicit A2A_NUDGE=channel gets here:
+			// DetectNudgeMode never returns it.
+			channel = agent.NewChannel(log)
+			store.OnIncoming = channel.Handle
+			log.Info("channel wake enabled")
 		case "dtach":
 			// dtach backend: inject into the supervising dtach master socket.
 			// Socket via A2A_NUDGE_SOCKET, defaulting to ~/.dtach/<name>.
@@ -230,6 +244,21 @@ func RunBridge(args []string, _, stderr io.Writer) int {
 	// loopback bridge's webhooks legitimately point at 127.0.0.1.
 	allowPrivatePush := !fed.Enabled() || os.Getenv("A2A_PUSH_ALLOW_PRIVATE") == "1"
 	pushSender := agent.NewPushSender(clientTLS, allowPrivatePush, log)
+
+	// The MCP server exists before the A2A server starts serving, so a
+	// message that arrives during startup finds the channel attached.
+	mcpSrv := server.NewMCPServer("a2abridge", buildinfo.Get().Version, channel.ServerOptions()...)
+	channel.Attach(mcpSrv)
+	agent.RegisterTools(mcpSrv, &agent.MCPDeps{
+		Lifetime:     ctx,
+		Store:        store,
+		Executor:     executor,
+		Peers:        peers,
+		OwnCard:      card,
+		SelfURL:      selfURL,
+		DirectoryURL: *directoryURL,
+		Log:          log,
+	})
 
 	a2aHandler, err := agent.NewA2AHTTPHandler(card, executor, tasks, pushConfigs, pushSender, log)
 	if err != nil {
@@ -297,25 +326,13 @@ func RunBridge(args []string, _, stderr io.Writer) int {
 		}
 	}()
 
-	mcpSrv := server.NewMCPServer("a2abridge", buildinfo.Get().Version)
-	agent.RegisterTools(mcpSrv, &agent.MCPDeps{
-		Lifetime:     ctx,
-		Store:        store,
-		Executor:     executor,
-		Peers:        peers,
-		OwnCard:      card,
-		SelfURL:      selfURL,
-		DirectoryURL: *directoryURL,
-		Log:          log,
-	})
-
 	go func() {
 		log.Info("mcp stdio server starting")
 		// ServeStdio reads os.Stdin and returns when it closes — which happens
 		// when the parent (MCP host) goes away. Always shut the bridge down when
 		// it returns, even on a clean EOF (err == nil), so the bridge never
 		// outlives its parent while still holding the port.
-		if err := server.ServeStdio(mcpSrv); err != nil {
+		if err := server.ServeStdio(mcpSrv, channel.StdioOptions()...); err != nil {
 			log.Error("mcp serve", "err", err)
 		}
 		log.Info("mcp stdio server exited, shutting down bridge")

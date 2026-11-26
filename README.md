@@ -428,7 +428,7 @@ Set per-bridge environment in your IDE config (the installer fills sensible defa
 | `A2A_MODEL` | unset | model id reported in Agent Card (`claude-opus-4-7`, `gpt-5`, ...) |
 | `A2A_SKILLS` | unset | comma-separated capability tags |
 | `A2A_STATE_DIR` | `./.a2a` | per-project inbox/label/log directory |
-| `A2A_NUDGE` | unset | wake an idle agent on inbound: `auto`, `tmux`, `terminal` (macOS Terminal.app) or `dtach` |
+| `A2A_NUDGE` | unset | wake an idle agent on inbound: `auto`, `tmux`, `terminal` (macOS Terminal.app), `dtach`, or `channel` (Claude Code MCP channels, see [Waking an idle Claude Code session](#waking-an-idle-claude-code-session)). `auto` never picks `channel` |
 | `A2A_NUDGE_SOCKET` | `~/.dtach/<name>` | dtach master socket used when `A2A_NUDGE=dtach` |
 | `A2A_RESPONDER` | unset | auto-answer inbound messages with a headless `claude` or `codex` CLI |
 | `A2A_PUSH_ALLOW_PRIVATE` | unset | `1` lets push-notification webhooks reach loopback/private addresses while federation TLS is on (a loopback bridge always allows them) |
@@ -454,8 +454,9 @@ the model in 5 lines:
 
 So end-to-end latency is **one prompt from the recipient + one from
 the sender** to see the reply. That is the same delay you'd have over
-DM with a colleague — the bridge doesn't wake idle agents, it just
-makes sure neither side misses the message.
+DM with a colleague — by default the bridge doesn't wake idle agents, it just
+makes sure neither side misses the message. `A2A_NUDGE` changes that; see
+[Waking an idle Claude Code session](#waking-an-idle-claude-code-session).
 
 One message per task: a task stays `working` until its reply, and A2A 1.0
 rejects another message to a task that is still being worked on. To continue a
@@ -466,6 +467,51 @@ The inbox file is a durable snapshot: a bridge restart restores messages that
 were not drained yet, a redelivered message with the same `messageId` is queued
 once, and past 500 entries the oldest are dropped. One-shot reply notifications
 age out two minutes after delivery, also across a restart.
+
+## Waking an idle Claude Code session
+
+With `A2A_NUDGE=channel` the bridge pushes every incoming message, and every
+reply to a task you sent, straight into the running Claude Code session as a
+[channel](https://code.claude.com/docs/en/channels-reference) event. An idle
+session wakes up and answers with `a2a_complete_task`, and nobody has to type
+into the terminal. The message also stays in the inbox, so the prompt hook
+still shows it if the event never arrives.
+
+Channels are a Claude Code research preview. They need a claude.ai login or
+a Console API key (not Amazon Bedrock, Google Cloud or Microsoft Foundry), an
+organization whose `channelsEnabled` policy allows them, and two things on
+your side:
+
+- **The server is in `.mcp.json` or the user config** (`~/.claude.json`, as
+  `a2abridge install` writes it). Claude Code's channel lookup does not find a
+  server passed with `--mcp-config` ("no MCP server configured with that name").
+- **Claude Code is started with the development flag**, naming the server as
+  it is called in that config:
+
+  ```bash
+  claude --dangerously-load-development-channels server:a2a
+  ```
+
+  Until a2abridge is on Anthropic's channel allowlist this flag is required,
+  and Claude Code shows a confirmation screen at every launch.
+
+Each event carries `task_id`, `context_id`, `claimed_from` and, for a reply to
+your own task, `kind="outgoing-reply"`. `claimed_from` is the name the sender
+gave itself; it is not verified, and the MCP instructions tell Claude so. With
+federation TLS on, the event also carries `peer_cert`, the name in the
+sender's verified client certificate; replies to your own tasks never carry it.
+
+In this mode the bridge offers MCP protocol versions up to 2025-11-25 only.
+Claude Code does not deliver channel events on a connection that negotiated
+the 2026-07-28 revision. Other modes are unaffected.
+
+Claude Code does not confirm that it registered a channel, so the bridge
+cannot detect a session that was started without the flag. It writes one
+warning to `./.a2a/bridge.log` with the first event, and another if the
+client is not Claude Code or uses the 2026-07-28 revision. A message that
+arrives before Claude Code has connected is not pushed; it waits in the inbox
+for the prompt hook. `A2A_RESPONDER` takes precedence over `A2A_NUDGE`, so
+leave it unset in this mode.
 
 ## Troubleshooting
 

@@ -54,6 +54,11 @@ type InboxEntry struct {
 	Kind      string `json:"kind,omitempty"`
 	State     string `json:"state,omitempty"`
 	TS        string `json:"ts,omitempty"`
+
+	// PeerCert is the name in the sender's verified client certificate,
+	// set only when federation TLS is on. It feeds the channel event and
+	// is not persisted.
+	PeerCert string `json:"-"`
 }
 
 // isSyntheticReply reports whether the entry is a synthetic outgoing-reply
