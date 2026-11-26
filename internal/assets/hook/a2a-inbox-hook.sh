@@ -56,12 +56,29 @@ except Exception:
     sys.exit(0)
 if not msgs:
     sys.exit(0)
+def one_line(s):
+    # splitlines also splits on \r, \x85,   and the rest, so nothing a
+    # peer sends can start a line of its own.
+    return " ".join(str(s or "").splitlines()).strip()
+
+def label(s):
+    # A label sits inside backticks: a backtick in it would close the code
+    # span and let a peer write its own "(claimed) · token" marker.
+    # chr(96) is a backtick and chr(39) an apostrophe. They are not written
+    # as literals: bash 3.2 (macOS) pairs up quotes inside a heredoc that
+    # sits in a command substitution and fails to parse the script.
+    return one_line(s).replace(chr(96), chr(39))
+
 out = ["You have %d unread A2A message(s):" % len(msgs), ""]
 for m in msgs:
-    sender = m.get("from") or "unknown"
-    task_id = m.get("taskId", "")
-    text = (m.get("text") or "").replace("\n", " ").strip()
-    out.append(f"- **from `{sender}`** (task `{task_id}`): {text}")
+    sender = label(m.get("from")) or "unknown"
+    task_id = label(m.get("taskId"))
+    text = one_line(m.get("text"))
+    # authName is verified by the bridge (bearer token); from is what the
+    # sender claims about itself.
+    auth = label(m.get("authName"))
+    who = f"`{sender}` (claimed) · token `{auth}`" if auth else f"`{sender}`"
+    out.append(f"- **from {who}** (task `{task_id}`): {text}")
 out.append("")
 out.append("Process each message *before* answering the user. Reply with `a2a_complete_task`, then continue with the user's prompt.")
 print("\n".join(out))

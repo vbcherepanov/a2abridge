@@ -432,8 +432,70 @@ Set per-bridge environment in your IDE config (the installer fills sensible defa
 | `A2A_NUDGE_SOCKET` | `~/.dtach/<name>` | dtach master socket used when `A2A_NUDGE=dtach` |
 | `A2A_RESPONDER` | unset | auto-answer inbound messages with a headless `claude` or `codex` CLI |
 | `A2A_PUSH_ALLOW_PRIVATE` | unset | `1` lets push-notification webhooks reach loopback/private addresses while federation TLS is on (a loopback bridge always allows them) |
+| `A2A_PEER_TOKENS` | unset | outbound bearer tokens, `peer=token` pairs separated by commas; `peer` is a base URL or a peer's Agent Card name |
+| `A2A_PEER_TOKENS_FILE` | unset | path to a file holding the same pairs, one per line or comma-separated (a `#` comment takes a whole line); set this or `A2A_PEER_TOKENS`, not both |
+| `A2A_AUTH_TOKENS` | unset | inbound bearer tokens, `name:token` pairs separated by commas (the format Hermes uses); when set, callers need one of them |
+| `A2A_AUTH_TOKENS_FILE` | unset | path to a file holding the same pairs; set this or `A2A_AUTH_TOKENS`, not both |
 
 Cross-machine federation: `A2A_TLS_CERT`, `A2A_TLS_KEY`, `A2A_TRUST_ROOTS` (required once cert/key are set), `A2A_PEER_ALLOW`.
+
+### Bearer tokens (Hermes and other A2A agents)
+
+Agents that authenticate with bearer tokens instead of client certificates,
+such as [Hermes](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/a2a),
+work with `A2A_PEER_TOKENS` and `A2A_AUTH_TOKENS`. For a Hermes agent at
+`https://hermes.example.com`:
+
+```bash
+# a2abridge -> Hermes: the token from Hermes's own A2A_PEER_TOKENS
+A2A_PEER_TOKENS="https://hermes.example.com=tok-for-hermes"
+# Hermes -> a2abridge: the token in Hermes's peer entry for this bridge
+A2A_AUTH_TOKENS="hermes:tok-for-bridge"
+```
+
+On the Hermes side the bridge is a peer with
+`auth: { type: bearer, token: "tok-for-bridge" }`.
+
+- **Outbound**, a token goes only to the peer it is configured for. A URL key
+  matches that origin (scheme, host and port) and path prefix; a path-scoped
+  key is not sent to a path with `..`, `.`, `//`, `\` or an encoded separator
+  such as `%2F` in it. A name key matches the `name` in the Agent Card
+  fetched from `peer_url` exactly (case-sensitive), and the token goes only
+  to that `peer_url`'s origin. When
+  both match, the URL key wins. A name key trusts the name the peer chose for
+  itself, so give a peer on another machine a URL key. A key without a scheme
+  is a name, so write URLs with `https://`; the startup log lists every URL
+  key and name key, never the tokens.
+- A token is never sent over plain HTTP to a host that is not loopback. A URL
+  key like that stops the bridge at startup, and a call that would send one
+  fails with an error that says why. A redirect is followed with a token only
+  when the original request already carried that same token on the same
+  origin. A redirect toward any other configured token (another peer, or
+  another path scope on the same gateway) is refused, so no peer can bounce
+  a call there and have it carry the token. A redirect to a place with no
+  token is followed and carries none.
+  A peer whose Agent Card sends the calls to another origin is refused with
+  an error saying so, instead of being called without its token.
+- **Inbound**, a request without a valid token gets `401` with
+  `WWW-Authenticate: Bearer`, and the bridge logs a warning (at most one a
+  minute) with the caller's address, the path and the reason. The Agent Card
+  and `/healthz` stay open, and `/metrics` needs a token. The card lists the
+  bearer scheme in `securitySchemes`. The token's name reaches the agent as
+  `authName`, next to the `from` the sender writes itself: `a2a_inbox` returns
+  both, the prompt hook shows ``from `alice` (claimed) · token `hermes` ``,
+  the `on-inbound` user hook gets `A2A_EVENT_AUTH_NAME`, and `A2A_RESPONDER`
+  labels both in its prompt.
+- Once a bridge sets `A2A_AUTH_TOKENS`, every other a2abridge that calls it
+  needs an `A2A_PEER_TOKENS` entry for it.
+- With mTLS federation on, a request needs a valid client certificate and a
+  valid token.
+- A malformed entry, a duplicate peer key, one token under two names, a token
+  with whitespace in it (a `#` comment must take a whole line), an unreadable
+  file, a variable set together with its `_FILE` twin, or a token variable
+  that is set but empty (a secret missing at deploy time) stops the bridge at
+  startup; to turn tokens off, leave the variables unset. Errors name the
+  entry, never the token, and tokens never reach the log. The bridge drops both token variables from its environment once read,
+  so the responder's `claude`/`codex` and the user hooks do not inherit them.
 
 ## How the inbox flow actually works
 
@@ -500,6 +562,8 @@ your own task, `kind="outgoing-reply"`. `claimed_from` is the name the sender
 gave itself; it is not verified, and the MCP instructions tell Claude so. With
 federation TLS on, the event also carries `peer_cert`, the name in the
 sender's verified client certificate; replies to your own tasks never carry it.
+With bearer tokens on (`A2A_AUTH_TOKENS`), it carries `auth_name`, the name of
+the token the sender authenticated with.
 
 In this mode the bridge offers MCP protocol versions up to 2025-11-25 only.
 Claude Code does not deliver channel events on a connection that negotiated
@@ -566,6 +630,7 @@ Metrics: the directory and every bridge serve Prometheus metrics at `/metrics`.
 - **PII / secret screen** before `a2a_send_message`: 11 regex detectors (AWS access key, GitHub PAT, Anthropic / OpenAI / Google / Stripe / Slack tokens, JWT, PEM private keys, ...). Matches are replaced with `[REDACTED:<name>]` and surfaced in MCP metadata. The message still goes through with redacted text — the secret never leaves the bridge.
 - **Push-notification webhooks** receive the client's `A2A-Notification-Token`. With federation TLS on, webhook URLs that resolve to loopback, private or link-local addresses are refused (`A2A_PUSH_ALLOW_PRIVATE=1` opts out).
 - **mTLS + ed25519 federation** (opt-in cross-machine): set `A2A_TLS_CERT`, `A2A_TLS_KEY`, `A2A_TRUST_ROOTS`, `A2A_PEER_ALLOW` and the bridge serves over TLS 1.3 with required client certs and an allow-list match on peer CN/SAN. `A2A_TRUST_ROOTS` is mandatory once cert/key are set — the bridge refuses to start without it (no silent fallback to the system pool). Keys are generated by `a2abridge cert generate`.
+- **Bearer tokens** (opt-in, for agents without client certificates such as Hermes): `A2A_AUTH_TOKENS` makes every route except the Agent Card and `/healthz` require a token, compared in constant time; `A2A_PEER_TOKENS` sends a token only to the peer it names, never over plain HTTP off loopback and never across a redirect to another host. See [Bearer tokens](#bearer-tokens-hermes-and-other-a2a-agents).
 - **Verified releases.** Every GitHub release ships a `checksums.txt`; `a2abridge update` and the `install.sh` / `install.ps1` scripts verify the binary's SHA256 against it before swapping anything in.
 - **User hook scripts**: drop `~/.a2abridge/hooks/{on-inbound,on-outgoing-reply}.sh` (or `.ps1`/`.cmd` on Windows) and the bridge fires them on every inbound message and outbound reply (5-second timeout, JSON on stdin, fields in `A2A_EVENT_*` env vars).
 - **No telemetry.** Period.

@@ -96,7 +96,7 @@ func run() int {
 	sender := agent.NewPushSender(nil, true, log)
 	executor := &scenarioExecutor{holdFor: holdFor}
 
-	handler, err := agent.NewA2AHTTPHandler(card, executor, tasks, pushConfigs, sender, log)
+	handler, err := agent.NewA2AHTTPHandler(card, executor, tasks, pushConfigs, sender, nil, log)
 	if err != nil {
 		log.Error("a2a handler", "err", err)
 		return 1

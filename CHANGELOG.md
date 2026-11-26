@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [4.1.0] — 2026-11-26
+
 ### Added
 
 - **`A2A_NUDGE=channel` wakes an idle Claude Code session through MCP
@@ -13,13 +15,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   agent sent, goes to the session as a `notifications/claude/channel` event
   with `task_id`, `context_id`, `claimed_from` (the sender's own claim, not
   verified) and, with federation TLS on, `peer_cert` (the verified certificate
-  name). In this mode the stdio server offers MCP versions up to 2025-11-25
+  name). With bearer tokens on, it also carries `auth_name`, the name of the
+  token the sender used. In this mode the stdio server offers MCP versions up to 2025-11-25
   only, because Claude Code skips channel events on a 2026-07-28 connection.
   `auto` never picks `channel`. The bridge logs one warning on the first event,
   since Claude Code does not confirm delivery, and one if the client is not
   Claude Code or uses the 2026-07-28 revision. Needs the server in
   `.mcp.json` or the user config and Claude Code started with
   `--dangerously-load-development-channels server:<name>`.
+
+- **Bearer tokens for peer calls** ([#47](https://github.com/vbcherepanov/a2abridge/issues/47)),
+  for A2A agents without client certificates, such as Hermes.
+  `A2A_PEER_TOKENS` (or `A2A_PEER_TOKENS_FILE`) sends `Authorization: Bearer`
+  to the peer each token is configured for, matched by base URL or by Agent
+  Card name. It never goes over plain HTTP to a host that is not loopback, and
+  never across a redirect to another host; a redirect toward a token the
+  original request did not carry is refused. `A2A_AUTH_TOKENS` (or
+  `A2A_AUTH_TOKENS_FILE`) takes `name:token` pairs. Without a valid token,
+  protocol routes and `/metrics` answer `401` with `WWW-Authenticate: Bearer`,
+  while the Agent Card and `/healthz` stay open. The card lists the bearer
+  scheme, and the token's name reaches the agent as `authName` next to the
+  self-reported `from`: in `a2a_inbox`, the prompt hook, the `on-inbound`
+  user hook (`A2A_EVENT_AUTH_NAME`) and the `A2A_RESPONDER` prompt. With mTLS
+  on, a request needs both. A malformed configuration, or a token variable
+  that is set but empty, stops the bridge at startup without printing the
+  token, and the token variables are dropped
+  from the environment that child processes inherit.
+
+### Fixed
+
+- **The prompt hook no longer lets a peer forge a message line.** A `from`
+  with a backtick or a line break could fake another sender's line in the
+  injected context. Labels lose their backticks, and line breaks in any
+  field become spaces.
 
 ### Changed
 

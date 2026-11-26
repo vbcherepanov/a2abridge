@@ -6,30 +6,35 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2aclient"
 	"github.com/a2aproject/a2a-go/v2/a2aclient/agentcard"
 )
 
-// Peers opens A2A clients to peer bridges over one shared HTTP client, so
-// federation TLS applies to card resolution and every protocol call alike.
+// Peers opens A2A clients to peer bridges over one shared HTTP transport, so
+// federation TLS and bearer tokens apply to card resolution and every
+// protocol call alike.
 type Peers struct {
-	http     *http.Client
-	resolver *agentcard.Resolver
-	log      *slog.Logger
+	transport *http.Transport
+	tokens    *PeerTokens
+	http      *http.Client
+	resolver  *agentcard.Resolver
+	log       *slog.Logger
 }
 
 // NewPeers returns a peer client factory. tlsConfig is the federation client
-// config (nil for plain loopback). The HTTP client has no overall timeout
-// because streaming calls must stay open; callers bound calls with contexts.
-func NewPeers(tlsConfig *tls.Config, log *slog.Logger) *Peers {
+// config (nil for plain loopback); tokens are the outbound bearer tokens (nil
+// for none). The HTTP client has no overall timeout because streaming calls
+// must stay open; callers bound calls with contexts.
+func NewPeers(tlsConfig *tls.Config, tokens *PeerTokens, log *slog.Logger) *Peers {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	if tlsConfig != nil {
 		transport.TLSClientConfig = tlsConfig.Clone()
 	}
-	client := &http.Client{Transport: transport}
-	return &Peers{http: client, resolver: agentcard.NewResolver(client), log: log}
+	client := (&bearerTransport{next: transport, tokens: tokens}).client()
+	return &Peers{transport: transport, tokens: tokens, http: client, resolver: agentcard.NewResolver(client), log: log}
 }
 
 // Resolve fetches the peer's Agent Card from its well-known path.
@@ -49,9 +54,29 @@ func (p *Peers) Client(ctx context.Context, baseURL string) (*a2aclient.Client, 
 	if err != nil {
 		return nil, err
 	}
+	base, err := url.Parse(baseURL)
+	if err != nil {
+		return nil, fmt.Errorf("peer url %s: %w", baseURL, err)
+	}
+	httpClient := p.http
+	transport := p.http.Transport.(*bearerTransport)
+	// A name-keyed token goes only to the origin of the URL we were asked to
+	// call, and only when the card served there carries that name.
+	nameTok, nameKeyed := p.tokens.forName(card.Name)
+	if nameKeyed {
+		transport = &bearerTransport{next: p.transport, tokens: p.tokens, nameOrigin: originOf(base), nameToken: nameTok}
+		httpClient = transport.client()
+	}
+	// A card that sends the calls to another origin would quietly drop the
+	// token and get a 401 back; say why instead.
+	if _, urlKeyed := p.tokens.forURL(base); urlKeyed || nameKeyed {
+		if !transport.coversAny(card.SupportedInterfaces) {
+			return nil, fmt.Errorf("the Agent Card of %s points at another origin; the token configured for this peer is not sent there", baseURL)
+		}
+	}
 	client, err := a2aclient.NewFromCard(ctx, card,
-		a2aclient.WithJSONRPCTransport(p.http),
-		a2aclient.WithRESTTransport(p.http),
+		a2aclient.WithJSONRPCTransport(httpClient),
+		a2aclient.WithRESTTransport(httpClient),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("connect to %s: %w", baseURL, err)

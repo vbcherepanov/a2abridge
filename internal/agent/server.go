@@ -36,12 +36,17 @@ const maxRequestBodyBytes = 10 << 20
 // A2A-Version, rejects SubscribeToTask for missing or finished tasks with a
 // plain error, serves the card with cache headers and stamps event
 // timestamps in UTC.
+//
+// With auth set, every route except the card and /healthz needs one of its
+// bearer tokens, and the token's name reaches the executor as the call's
+// authenticated User. nil auth leaves every route open.
 func NewA2AHTTPHandler(
 	card *a2a.AgentCard,
 	executor a2asrv.AgentExecutor,
 	tasks taskstore.Store,
 	pushConfigs push.ConfigStore,
 	pushSender push.Sender,
+	auth *AuthTokens,
 	log *slog.Logger,
 ) (http.Handler, error) {
 	cardHandler, err := newAgentCardHandler(card, time.Now())
@@ -58,11 +63,15 @@ func NewA2AHTTPHandler(
 	handler := a2asrv.NewHandler(utcExecutor{next: executor},
 		a2asrv.WithTaskStore(tasks),
 		a2asrv.WithPushNotifications(pushConfigs, pushSender),
-		a2asrv.WithCallInterceptors(enforcer, peerCertInterceptor{}),
+		a2asrv.WithCallInterceptors(enforcer, peerCertInterceptor{}, authInterceptor{}),
 		a2asrv.WithLogger(log),
 	)
+	protect := func(h http.Handler) http.Handler { return h }
+	if auth != nil {
+		protect = func(h http.Handler) http.Handler { return auth.requireBearer(h, log) }
+	}
 	guard := &protocolGuard{tasks: tasks, streaming: card.Capabilities.Streaming, log: log}
-	rest := guard.rest(a2asrv.NewRESTHandler(handler))
+	rest := protect(guard.rest(a2asrv.NewRESTHandler(handler)))
 
 	mux := http.NewServeMux()
 	// No method in the pattern: the card handler answers CORS preflight itself.
@@ -73,10 +82,10 @@ func NewA2AHTTPHandler(
 		}
 	})
 	// Per-bridge metrics (inbox_size, messages_received, tasks_failed, ...).
-	mux.Handle("GET /metrics", metrics.Handler())
+	mux.Handle("GET /metrics", protect(metrics.Handler()))
 	// {$} pins the JSON-RPC endpoint to exactly "/" so unknown paths get a
 	// proper 404 from the mux instead of falling into the dispatcher.
-	mux.Handle("POST /{$}", guard.jsonrpc(a2asrv.NewJSONRPCHandler(handler)))
+	mux.Handle("POST /{$}", protect(guard.jsonrpc(a2asrv.NewJSONRPCHandler(handler))))
 	// The REST handler routes methods itself; only its paths are delegated.
 	for _, pattern := range []string{"/message:send", "/message:stream", "/tasks", "/tasks/", "/extendedAgentCard"} {
 		mux.Handle(pattern, rest)
