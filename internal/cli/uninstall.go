@@ -74,7 +74,7 @@ func RunUninstall(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "uninstall: home dir: %v\n", err)
 		failed = true
 	} else {
-		removePath(stdout, stderr, filepath.Join(home, ".claude", "skills", "a2a-bridge"), "skill", *dryRun, *purge)
+		removeSkill(stdout, stderr, home, *dryRun, *purge)
 		removePath(stdout, stderr, filepath.Join(home, ".claude", "hooks", "a2a-inbox-hook.sh"), "hook", *dryRun, *purge)
 		if *purge {
 			removePath(stdout, stderr, filepath.Join(home, ".a2abridge"), "state dir", *dryRun, true)
@@ -132,6 +132,34 @@ func removeMCPBlock(stdout, stderr io.Writer, w ideconfig.Writer, path string, d
 	return false
 }
 
+// removeSkill takes the skill out of ~/.claude/skills. Without purge the
+// tree goes to ~/.a2abridge/backups: a ".bak" copy left beside it would
+// still be loaded by Claude Code as a skill.
+func removeSkill(stdout, stderr io.Writer, home string, dryRun, purge bool) {
+	const label = "skill"
+	path := filepath.Join(home, ".claude", "skills", "a2a-bridge")
+	if purge {
+		removePath(stdout, stderr, path, label, dryRun, true)
+		return
+	}
+	if _, err := os.Stat(path); err != nil {
+		if !os.IsNotExist(err) {
+			fmt.Fprintf(stderr, "  [WARN]  %-15s  %v\n", label, err)
+		}
+		return
+	}
+	if dryRun {
+		fmt.Fprintf(stdout, "  [plan]   %-15s  %s — move to ~/.a2abridge/backups\n", label, path)
+		return
+	}
+	bak, err := moveToBackups(home, path, "skill-a2a-bridge")
+	if err != nil {
+		fmt.Fprintf(stderr, "  [WARN]  %-15s  backup: %v\n", label, err)
+		return
+	}
+	fmt.Fprintf(stdout, "  [backup] %-15s  %s → %s\n", label, path, bak)
+}
+
 // removePath deletes a file or directory tree. Without purge we rename
 // to <path>.bak.<ts> so the user can restore. With purge we delete.
 func removePath(stdout, stderr io.Writer, path, label string, dryRun, purge bool) {
@@ -159,7 +187,7 @@ func removePath(stdout, stderr io.Writer, path, label string, dryRun, purge bool
 		fmt.Fprintf(stdout, "  [purge]  %-15s  %s\n", label, path)
 		return
 	}
-	bak := path + ".bak." + time.Now().Format("20060102-150405")
+	bak := path + ".bak." + time.Now().Format(backupStamp)
 	if err := os.Rename(path, bak); err != nil {
 		fmt.Fprintf(stderr, "  [WARN]  %-15s  rename: %v\n", label, err)
 		return

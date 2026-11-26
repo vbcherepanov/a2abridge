@@ -17,6 +17,9 @@ import (
 //
 //	[mcp_servers.a2a.env]
 //	A2A_DIRECTORY = "..."
+//
+// The file is patched in place (see codextoml.go), so the user's comments,
+// key order and every table this package does not manage stay as they were.
 type codexWriter struct{}
 
 func (codexWriter) Name() string { return "Codex CLI" }
@@ -57,21 +60,10 @@ func (w codexWriter) Write(spec Spec, dryRun bool) Result {
 	res.Path = path
 	res.Found = fileExists(path)
 
-	// BurntSushi/toml decodes into a generic map so we can keep all the
-	// user's other keys intact.
-	root := map[string]any{}
-	if res.Found {
-		b, err := os.ReadFile(path)
-		if err != nil {
-			res.Error = err
-			return res
-		}
-		if len(b) > 0 {
-			if err := toml.Unmarshal(b, &root); err != nil {
-				res.Error = fmt.Errorf("parse %s: %w", path, err)
-				return res
-			}
-		}
+	raw, root, err := readTOMLConfig(path)
+	if err != nil {
+		res.Error = err
+		return res
 	}
 
 	servers, _ := root["mcp_servers"].(map[string]any)
@@ -80,8 +72,9 @@ func (w codexWriter) Write(spec Spec, dryRun bool) Result {
 		root["mcp_servers"] = servers
 	}
 
-	desired := codexEntry(spec)
-	if equalTOMLEntry(servers[spec.Key], desired) {
+	existing := servers[spec.Key]
+	desired := mergeMCPEntry(existing, spec)
+	if equalTOMLEntry(existing, desired) {
 		res.Skipped = true
 		return res
 	}
@@ -92,6 +85,17 @@ func (w codexWriter) Write(spec Spec, dryRun bool) Result {
 		return res
 	}
 
+	out, inPlace, err := renderTOMLConfig(root, func() ([]byte, error) {
+		return patchCodexEntry(raw, spec.Key, existing, desired)
+	})
+	if err != nil {
+		res.Error = err
+		return res
+	}
+	if !inPlace && res.Found {
+		res.Note = rewriteNote
+	}
+
 	if res.Found {
 		bak, berr := backupFile(path)
 		if berr != nil {
@@ -100,14 +104,7 @@ func (w codexWriter) Write(spec Spec, dryRun bool) Result {
 		}
 		res.Backup = bak
 	}
-
-	var buf bytes.Buffer
-	enc := toml.NewEncoder(&buf)
-	if err := enc.Encode(root); err != nil {
-		res.Error = err
-		return res
-	}
-	if err := writeFileAtomic(path, buf.Bytes(), newConfigMode); err != nil {
+	if err := writeFileAtomic(path, out, newConfigMode); err != nil {
 		res.Error = err
 		return res
 	}
@@ -115,18 +112,60 @@ func (w codexWriter) Write(spec Spec, dryRun bool) Result {
 	return res
 }
 
-// codexEntry produces the table value Codex expects.
-func codexEntry(spec Spec) map[string]any {
-	out := map[string]any{
-		"command": spec.BinaryPath,
-		"args":    []any{"bridge"},
-	}
-	if len(spec.Env) > 0 {
-		envTable := map[string]any{}
-		for k, v := range spec.Env {
-			envTable[k] = v
+// rewriteNote explains the fallback path of renderTOMLConfig to the user.
+const rewriteNote = "config layout could not be patched in place; file was re-encoded, comments are in the backup"
+
+// readTOMLConfig returns the raw bytes of path and its decoded top-level
+// table. A missing or empty file yields an empty table.
+func readTOMLConfig(path string) (raw []byte, root map[string]any, err error) {
+	root = map[string]any{}
+	raw, err = os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, root, nil
 		}
-		out["env"] = envTable
+		return nil, nil, err
+	}
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return raw, root, nil
+	}
+	if err := toml.Unmarshal(raw, &root); err != nil {
+		return nil, nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	return raw, root, nil
+}
+
+// renderTOMLConfig returns the bytes to write for want. It prefers the
+// result of patch, a text edit of the original file, and accepts it only
+// when it decodes to exactly want. Otherwise it re-encodes want from
+// scratch, which is always correct but drops comments and key order.
+// inPlace reports which of the two was used.
+func renderTOMLConfig(want map[string]any, patch func() ([]byte, error)) (out []byte, inPlace bool, err error) {
+	if patched, perr := patch(); perr == nil {
+		got := map[string]any{}
+		if uerr := toml.Unmarshal(patched, &got); uerr == nil && equalTOMLEntry(dropEmptyServers(got), dropEmptyServers(want)) {
+			return patched, true, nil
+		}
+	}
+	var buf bytes.Buffer
+	if err := toml.NewEncoder(&buf).Encode(want); err != nil {
+		return nil, false, err
+	}
+	return buf.Bytes(), false, nil
+}
+
+// dropEmptyServers returns root without an empty mcp_servers table, so a
+// leftover "[mcp_servers]" header compares equal to no header at all.
+func dropEmptyServers(root map[string]any) map[string]any {
+	servers, ok := root["mcp_servers"].(map[string]any)
+	if !ok || len(servers) > 0 {
+		return root
+	}
+	out := make(map[string]any, len(root))
+	for k, v := range root {
+		if k != "mcp_servers" {
+			out[k] = v
+		}
 	}
 	return out
 }

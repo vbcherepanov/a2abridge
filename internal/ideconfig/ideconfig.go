@@ -37,6 +37,10 @@ type Spec struct {
 	// Env is the environment block injected into the MCP server entry. Order
 	// is preserved by writers where the format supports ordered maps.
 	Env map[string]string
+	// ForceEnv names the Env keys that replace a value the user already
+	// has. Every other key only fills a gap, so a hand-tuned entry survives
+	// a re-install.
+	ForceEnv map[string]bool
 	// HookCommand — when non-empty, Claude Code's writer registers it as a
 	// UserPromptSubmit hook in the same settings.json transaction. Other
 	// IDEs ignore this field (they have no equivalent concept).
@@ -57,6 +61,53 @@ func DefaultSpec(binaryPath string) Spec {
 	}
 }
 
+// bridgeSubcommand is the argument every IDE passes to the binary.
+const bridgeSubcommand = "bridge"
+
+// mergeMCPEntry lays spec over the entry the user already has. Keys this
+// package does not manage (a transport type, tool approvals, extra env
+// vars) are kept. The binary path is always replaced. Args are replaced
+// unless they already start the bridge, and an env value the user set is
+// replaced only for keys listed in spec.ForceEnv.
+func mergeMCPEntry(existing any, spec Spec) map[string]any {
+	out := map[string]any{}
+	if cur, ok := existing.(map[string]any); ok {
+		for k, v := range cur {
+			out[k] = v
+		}
+	}
+	out["command"] = spec.BinaryPath
+	if !startsBridge(out["args"]) {
+		out["args"] = []any{bridgeSubcommand}
+	}
+
+	env := map[string]any{}
+	if cur, ok := out["env"].(map[string]any); ok {
+		for k, v := range cur {
+			env[k] = v
+		}
+	}
+	for k, v := range spec.Env {
+		if _, has := env[k]; !has || spec.ForceEnv[k] {
+			env[k] = v
+		}
+	}
+	if len(env) > 0 {
+		out["env"] = env
+	}
+	return out
+}
+
+// startsBridge reports whether args already launch the bridge subcommand.
+func startsBridge(args any) bool {
+	list, ok := args.([]any)
+	if !ok || len(list) == 0 {
+		return false
+	}
+	first, _ := list[0].(string)
+	return first == bridgeSubcommand
+}
+
 // Result captures what one writer did so the installer can summarise.
 type Result struct {
 	IDE     string // human-readable IDE name
@@ -65,6 +116,7 @@ type Result struct {
 	Updated bool   // we wrote a new MCP block (or rewrote a stale one)
 	Skipped bool   // we found the config but the MCP block was already up to date
 	Backup  string // path to the .bak we created (empty if no write)
+	Note    string // extra detail the installer prints next to the result
 	DryRun  bool
 	Error   error
 }

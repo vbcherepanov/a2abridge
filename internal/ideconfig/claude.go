@@ -84,23 +84,6 @@ func (w claudeCodeWriter) Write(spec Spec, dryRun bool) Result {
 	return res
 }
 
-// mcpEntryJSON renders the MCP server block in the format every JSON-based
-// IDE we support agrees on (Claude Code, Cursor, Cline, Gemini CLI).
-func mcpEntryJSON(spec Spec) map[string]any {
-	envObj := make(map[string]any, len(spec.Env))
-	for k, v := range spec.Env {
-		envObj[k] = v
-	}
-	entry := map[string]any{
-		"command": spec.BinaryPath,
-		"args":    []any{"bridge"},
-	}
-	if len(envObj) > 0 {
-		entry["env"] = envObj
-	}
-	return entry
-}
-
 // needsHookUpdate inspects the existing settings.json hook list and reports
 // whether our hook command is already present under UserPromptSubmit. Used
 // to avoid unnecessary rewrites (idempotency).

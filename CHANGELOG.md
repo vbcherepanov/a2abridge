@@ -6,6 +6,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [4.1.1] — 2026-11-26
+
+### Fixed
+
+- **`install --apply` no longer discards what you added to the `a2a` entry.**
+  It used to replace the whole entry, so a transport `type`, extra env vars
+  such as `A2A_MODEL` or `A2A_SKILLS`, and extra `bridge` flags were gone after
+  an upgrade. The entry is now merged: the binary path is updated, missing env
+  vars are filled in, everything else stays. `--directory` replaces the stored
+  directory URL only when you pass the flag. Applies to Claude Code, Codex,
+  Cursor, Cline, Gemini CLI and Antigravity CLI.
+- **Codex `config.toml` is edited in place.** `install` and `uninstall` used to
+  re-encode the whole file, which dropped every comment, reordered the tables
+  and lost the tool approval tables under `[mcp_servers.a2a]`. Now only the
+  lines of the `a2a` entry change. A layout that cannot be patched line by line
+  is still re-encoded, with a note in the output and the original in the
+  `.bak` file.
+- **No more duplicate skill in Claude Code.** The previous skill was renamed to
+  `a2a-bridge.bak.<timestamp>` inside `~/.claude/skills`, where Claude Code
+  loaded it as a second skill. Backups of the skill now go to
+  `~/.a2abridge/backups`, on `install` and on `uninstall`. A skill or hook that
+  already matches the bundled one is left alone, so re-running `install` makes
+  no backup at all.
+- **`doctor` no longer reports a customised entry as stale.** It compared the
+  entry literally with the defaults and resolved its own path differently from
+  `install`, so a fresh install with a symlinked binary or a hand-added env var
+  showed a warning.
+
 ## [4.1.0] — 2026-11-26
 
 ### Added

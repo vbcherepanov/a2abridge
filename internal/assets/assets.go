@@ -4,6 +4,7 @@
 package assets
 
 import (
+	"bytes"
 	"embed"
 	"io/fs"
 	"os"
@@ -55,4 +56,63 @@ func CopyTree(src fs.FS, dst string) error {
 		}
 		return os.WriteFile(out, data, mode)
 	})
+}
+
+// TreeMatches reports whether dst holds exactly the files of src with the
+// same contents: nothing missing, nothing changed, nothing extra. A dst
+// that does not exist does not match.
+func TreeMatches(src fs.FS, dst string) (bool, error) {
+	want := map[string]bool{}
+	same := true
+	err := fs.WalkDir(src, ".", func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		want[filepath.ToSlash(p)] = true
+		expected, err := fs.ReadFile(src, p)
+		if err != nil {
+			return err
+		}
+		got, err := os.ReadFile(filepath.Join(dst, filepath.FromSlash(p)))
+		if err != nil {
+			if os.IsNotExist(err) {
+				same = false
+				return fs.SkipAll
+			}
+			return err
+		}
+		if !bytes.Equal(expected, got) {
+			same = false
+			return fs.SkipAll
+		}
+		return nil
+	})
+	if err != nil || !same {
+		return false, err
+	}
+
+	err = filepath.WalkDir(dst, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(dst, p)
+		if err != nil {
+			return err
+		}
+		if !want[filepath.ToSlash(rel)] {
+			same = false
+			return fs.SkipAll
+		}
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return same, nil
 }
